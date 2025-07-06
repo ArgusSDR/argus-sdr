@@ -1,0 +1,16 @@
+Write a plan for this, and write all of itit to PLAN.md.
+
+1. REST API
+2. Has authetication using email addresses and passwords
+3. Written in Golang
+4. Uses LetsEncrypt for SSL certificates
+5. Once authenticated type 1 clients register
+6. Once type 1 clients are registered a websocket is held open to allow the server to request data from them.
+7. The authentication information is stored in  a SQLite database
+8. Type 2 clients also authenticate
+9. Type 2 clients request data from the API, and the API calculates that data from the Type 1 clients.
+10. The minimium number of Type 1 clients is 3
+11. If there are more than 3 Type 1 clients then pick 3 of them randomly
+
+
+Use PLAN.md as a guide, make your own tasks based on it, and start writing the application.
