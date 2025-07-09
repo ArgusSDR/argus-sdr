@@ -5,10 +5,10 @@ import (
 	"net/http"
 	"time"
 
-	"sdr-api/internal/auth"
-	"sdr-api/internal/models"
-	"sdr-api/pkg/config"
-	"sdr-api/pkg/logger"
+	"argus-sdr/internal/auth"
+	"argus-sdr/internal/models"
+	"argus-sdr/pkg/config"
+	"argus-sdr/pkg/logger"
 
 	"github.com/gin-gonic/gin"
 )

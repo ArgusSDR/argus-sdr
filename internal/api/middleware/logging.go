@@ -1,7 +1,7 @@
 package middleware
 
 import (
-	"sdr-api/pkg/logger"
+	"argus-sdr/pkg/logger"
 
 	"github.com/gin-gonic/gin"
 )

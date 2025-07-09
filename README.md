@@ -114,7 +114,7 @@ curl -X GET http://localhost:8080/api/data/spectrum \
 ### Project Structure
 
 ```
-sdr-api/
+argus-sdr/
 ├── cmd/server/main.go          # Application entry point
 ├── internal/
 │   ├── api/                    # API routes and handlers
@@ -130,7 +130,7 @@ sdr-api/
 ### Building
 
 ```bash
-go build -o sdr-api cmd/server/main.go
+go build -o argus-sdr cmd/server/main.go
 ```
 
 ### Testing

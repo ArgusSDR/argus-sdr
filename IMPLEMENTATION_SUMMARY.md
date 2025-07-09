@@ -10,11 +10,11 @@ Based on the requirements in `PLAN.md`, I have completed a fully functional SDR 
 2. **✅ Email/Password Authentication**: JWT-based authentication system with bcrypt password hashing
 3. **✅ Golang Implementation**: Built entirely in Go with clean architecture patterns
 4. **✅ LetsEncrypt SSL Support**: Configurable SSL certificates via environment variables
-5. **✅ Type 1 Client Registration**: SDR devices can register and maintain persistent connections
-6. **✅ WebSocket Connections**: Persistent WebSocket connections for Type 1 clients
-7. **✅ Type 2 Client Data Requests**: Data consumers can request processed data via REST API
+5. **✅ Collector Client Registration**: SDR devices can register and maintain persistent connections
+6. **✅ WebSocket Connections**: Persistent WebSocket connections for Collector clients
+7. **✅ receiver Client Data Requests**: Data consumers can request processed data via REST API
 8. **✅ SQLite Database**: Authentication and client management stored in SQLite
-9. **✅ Minimum 3 Type 1 Clients**: API enforces minimum of 3 connected Type 1 clients
+9. **✅ Minimum 1 Collector Clients**: API enforces minimum of 1 connected Collector clients
 10. **✅ Random Selection**: When >3 clients available, randomly selects 3 for data requests
 
 ### 🏗️ **Architecture Implemented**
@@ -34,14 +34,14 @@ Based on the requirements in `PLAN.md`, I have completed a fully functional SDR 
 - `POST /api/auth/logout` - User logout
 - `GET /api/auth/me` - Get current user info
 
-#### Type 1 Clients (SDR Devices)
-- `POST /api/type1/register` - Register Type 1 client
-- `GET /api/type1/status` - Get client status
-- `PUT /api/type1/update` - Update client info
+#### Collector Clients (SDR Devices)
+- `POST /api/collector/register` - Register Collector client
+- `GET /api/collector/status` - Get client status
+- `PUT /api/collector/update` - Update client info
 - `GET /ws` - WebSocket connection endpoint
 
-#### Type 2 Clients (Data Consumers)
-- `GET /api/data/availability` - Check Type 1 client availability
+#### receiver Clients (Data Consumers)
+- `GET /api/data/availability` - Check Collector client availability
 - `GET /api/data/spectrum` - Request spectrum data
 - `GET /api/data/signal` - Request signal analysis
 
@@ -51,7 +51,7 @@ Based on the requirements in `PLAN.md`, I have completed a fully functional SDR 
 ### 🔧 **Technical Features**
 
 - **JWT Authentication**: Secure token-based authentication with configurable expiry
-- **Client Type Authorization**: Enforced separation between Type 1 and Type 2 clients
+- **Client Type Authorization**: Enforced separation between Collector and receiver clients
 - **WebSocket Management**: Connection pooling, heartbeat, and automatic cleanup
 - **Database Schema**: Proper foreign keys, indexes, and constraints
 - **Logging**: Structured logging with different levels (INFO, ERROR, DEBUG, WARN)

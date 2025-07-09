@@ -6,11 +6,18 @@ import (
 )
 
 type Config struct {
+	// Common
+	Mode        string `env:"MODE" default:"api"`
 	Environment string
-	Server      ServerConfig
-	Database    DatabaseConfig
-	SSL         SSLConfig
-	Auth        AuthConfig
+	LogLevel    string `env:"LOG_LEVEL" default:"info"`
+
+	// Mode-specific configs
+	Server    ServerConfig
+	Database  DatabaseConfig
+	SSL       SSLConfig
+	Auth      AuthConfig
+	Collector CollectorConfig
+	Receiver  ReceiverConfig
 }
 
 type ServerConfig struct {
@@ -35,9 +42,27 @@ type AuthConfig struct {
 	BCryptCost    int
 }
 
+type CollectorConfig struct {
+	StationID       string `env:"STATION_ID"`
+	DataDir         string `env:"DATA_DIR" default:"./nice_data"`
+	ContainerImage  string `env:"CONTAINER_IMAGE" default:"argussdr/sdr-tdoa-df:release-0.3"`
+	APIServerURL    string `env:"API_SERVER_URL"`
+}
+
+type ReceiverConfig struct {
+	ReceiverID   string `env:"RECEIVER_ID"`
+	DownloadDir  string `env:"DOWNLOAD_DIR" default:"./downloads"`
+	APIServerURL string `env:"API_SERVER_URL"`
+}
+
 func Load() (*Config, error) {
 	cfg := &Config{
+		// Common
+		Mode:        getEnv("MODE", "api"),
 		Environment: getEnv("ENVIRONMENT", "development"),
+		LogLevel:    getEnv("LOG_LEVEL", "info"),
+
+		// API Server
 		Server: ServerConfig{
 			Address: getEnv("SERVER_ADDRESS", ":8080"),
 			Port:    getEnvInt("SERVER_PORT", 8080),
@@ -55,6 +80,21 @@ func Load() (*Config, error) {
 			JWTSecret:   getEnv("JWT_SECRET", "your-secret-key-change-in-production"),
 			TokenExpiry: getEnvInt("TOKEN_EXPIRY_HOURS", 24),
 			BCryptCost:  getEnvInt("BCRYPT_COST", 12),
+		},
+
+		// Collector Client
+		Collector: CollectorConfig{
+			StationID:      getEnv("STATION_ID", ""),
+			DataDir:        getEnv("DATA_DIR", "./nice_data"),
+			ContainerImage: getEnv("CONTAINER_IMAGE", "argussdr/sdr-tdoa-df:release-0.3"),
+			APIServerURL:   getEnv("API_SERVER_URL", "http://localhost:8080"),
+		},
+
+		// Receiver Client
+		Receiver: ReceiverConfig{
+			ReceiverID:   getEnv("RECEIVER_ID", ""),
+			DownloadDir:  getEnv("DOWNLOAD_DIR", "./downloads"),
+			APIServerURL: getEnv("API_SERVER_URL", "http://localhost:8080"),
 		},
 	}
 

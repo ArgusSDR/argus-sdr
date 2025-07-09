@@ -34,7 +34,7 @@ ehthumbs.db
 Thumbs.db
 
 # Project specific
-sdr-api
+argus-sdr
 *.db
 *.sqlite
 *.sqlite3

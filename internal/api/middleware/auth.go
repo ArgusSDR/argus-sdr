@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"strings"
 
-	"sdr-api/internal/auth"
-	"sdr-api/pkg/config"
+	"argus-sdr/internal/auth"
+	"argus-sdr/pkg/config"
 
 	"github.com/gin-gonic/gin"
 )

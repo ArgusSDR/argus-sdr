@@ -5,8 +5,8 @@ import (
 	"math/rand"
 	"net/http"
 
-	"sdr-api/pkg/config"
-	"sdr-api/pkg/logger"
+	"argus-sdr/pkg/config"
+	"argus-sdr/pkg/logger"
 
 	"github.com/gin-gonic/gin"
 )
@@ -26,24 +26,18 @@ func NewType2Handler(db *sql.DB, log *logger.Logger, cfg *config.Config) *Type2H
 }
 
 func (h *Type2Handler) GetAvailability(c *gin.Context) {
-	// Count connected Type 1 clients
-	var connectedCount int
-	err := h.db.QueryRow(
-		"SELECT COUNT(*) FROM type1_clients WHERE status = 'connected'",
-	).Scan(&connectedCount)
+	// Get connected clients from the connection manager instead of database
+	// This ensures we only count actually connected clients
+	connectedClientIDs := connManager.GetConnectedClients()
+	connectedCount := len(connectedClientIDs)
+	minimumClients := 1
 
-	if err != nil {
-		h.log.Error("Failed to get client count: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check availability"})
-		return
-	}
-
-	available := connectedCount >= 3
+	available := connectedCount >= minimumClients
 
 	c.JSON(http.StatusOK, gin.H{
-		"available":        available,
+		"available":         available,
 		"connected_clients": connectedCount,
-		"minimum_required":  3,
+		"minimum_required":  minimumClients,
 	})
 }
 

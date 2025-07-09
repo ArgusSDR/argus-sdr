@@ -1,4 +1,4 @@
-Write a plan for this, and write all of itit to PLAN.md.
+Write a plan for this, and write all of it to PLAN.md.
 
 1. REST API
 2. Has authetication using email addresses and passwords

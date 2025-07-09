@@ -50,3 +50,41 @@ type Type1RegisterRequest struct {
 	ClientName   string `json:"client_name" binding:"required"`
 	Capabilities string `json:"capabilities"`
 }
+
+// ICE Signaling structures
+type ICECandidate struct {
+	Candidate     string `json:"candidate"`
+	SDPMLineIndex int    `json:"sdpMLineIndex"`
+	SDPMid        string `json:"sdpMid"`
+}
+
+type SessionDescription struct {
+	Type string `json:"type"`
+	SDP  string `json:"sdp"`
+}
+
+type ICESignalRequest struct {
+	SessionID           string              `json:"session_id" binding:"required"`
+	Type                string              `json:"type" binding:"required,oneof=offer answer candidate"`
+	SessionDescription  *SessionDescription `json:"session_description,omitempty"`
+	ICECandidate        *ICECandidate       `json:"ice_candidate,omitempty"`
+	TargetClientType    int                 `json:"target_client_type"`
+	TargetClientIDs     []int               `json:"target_client_ids,omitempty"`
+}
+
+type ICESignalResponse struct {
+	SessionID string `json:"session_id"`
+	Success   bool   `json:"success"`
+	Message   string `json:"message,omitempty"`
+}
+
+type FileTransferRequest struct {
+	Parameters   string `json:"parameters"` // JSON string with request parameters (optional)
+}
+
+type FileTransferResponse struct {
+	SessionID string `json:"session_id"`
+	Success   bool   `json:"success"`
+	Message   string `json:"message,omitempty"`
+	FileURL   string `json:"file_url,omitempty"`
+}
