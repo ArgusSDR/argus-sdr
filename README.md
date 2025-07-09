@@ -1,19 +1,12 @@
-# SDR API
+# Argus SDR
 
-A REST API for Software Defined Radio (SDR) data management with two types of clients.
-
-## Overview
-
-- **Type 1 Clients**: SDR devices/software that provide data via persistent WebSocket connections
-- **Type 2 Clients**: Data consumers that request calculated data via REST API
+A REST API for Software Defined Radio (SDR) data management with collector and receiver clients.
 
 ## Features
 
 - Email/password authentication with JWT tokens
 - SQLite database for user and client management
-- WebSocket support for Type 1 clients
-- Random selection of 3 Type 1 clients when more than 3 are available
-- LetsEncrypt SSL certificate support (configurable)
+- WebSocket support for collector clients
 
 ## Quick Start
 
@@ -58,16 +51,16 @@ Set environment variables to configure the application:
 - `POST /api/auth/logout` - Logout
 - `GET /api/auth/me` - Get current user info
 
-### Type 1 Clients (SDR Devices)
+### Collector Clients (SDR Devices)
 
-- `POST /api/type1/register` - Register Type 1 client
+- `POST /api/type1/register` - Register collector client
 - `GET /api/type1/status` - Get client status
 - `PUT /api/type1/update` - Update client info
 - `GET /ws` - WebSocket connection endpoint
 
-### Type 2 Clients (Data Consumers)
+### Receiver Clients (Data Consumers)
 
-- `GET /api/data/availability` - Check Type 1 client availability
+- `GET /api/data/availability` - Check collector client availability
 - `GET /api/data/spectrum` - Request spectrum data
 - `GET /api/data/signal` - Request signal analysis
 
@@ -77,7 +70,7 @@ Set environment variables to configure the application:
 
 ## Example Usage
 
-### Register a Type 1 Client
+### Register a Collector Client
 
 ```bash
 # Register user
@@ -85,14 +78,14 @@ curl -X POST http://localhost:8080/api/auth/register \
   -H "Content-Type: application/json" \
   -d '{"email": "sdr1@example.com", "password": "password123", "client_type": 1}'
 
-# Register Type 1 client
+# Register Collector client
 curl -X POST http://localhost:8080/api/type1/register \
   -H "Authorization: Bearer YOUR_JWT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"client_name": "SDR Device 1", "capabilities": "{\"frequency_range\": \"88-108MHz\"}"}'
 ```
 
-### Register a Type 2 Client and Request Data
+### Register a Receiver Client and Request Data
 
 ```bash
 # Register user
