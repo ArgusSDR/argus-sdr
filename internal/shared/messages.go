@@ -11,12 +11,13 @@ type DataRequest struct {
 
 // DataResponse represents the response from a collector
 type DataResponse struct {
-	RequestID string `json:"request_id"`
-	Status    string `json:"status"` // "processing", "ready", "error"
-	FilePath  string `json:"file_path,omitempty"`
-	FileSize  int64  `json:"file_size,omitempty"`
-	Error     string `json:"error,omitempty"`
-	StationID string `json:"station_id"`
+	RequestID   string `json:"request_id"`
+	Status      string `json:"status"` // "processing", "ready", "error"
+	FilePath    string `json:"file_path,omitempty"`
+	DownloadURL string `json:"download_url,omitempty"` // URL for downloading the file
+	FileSize    int64  `json:"file_size,omitempty"`
+	Error       string `json:"error,omitempty"`
+	StationID   string `json:"station_id"`
 }
 
 // FileReadyNotification is sent when a file is ready for download

@@ -4,14 +4,19 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
+	"argus-sdr/internal/auth"
+	"argus-sdr/internal/models"
 	"argus-sdr/internal/shared"
 	"argus-sdr/pkg/config"
 	"argus-sdr/pkg/logger"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 )
 
 type DataHandler struct {
@@ -19,6 +24,17 @@ type DataHandler struct {
 	logger           *logger.Logger
 	cfg              *config.Config
 	collectorHandler *CollectorHandler
+	receiverConns    map[string]*websocket.Conn
+	connMutex        sync.RWMutex
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+	HandshakeTimeout: 30 * time.Second,
+	ReadBufferSize:   1024,
+	WriteBufferSize:  1024,
 }
 
 // SetCollectorHandler sets the collector handler for WebSocket communications
@@ -28,9 +44,10 @@ func (h *DataHandler) SetCollectorHandler(collectorHandler *CollectorHandler) {
 
 func NewDataHandler(db *sql.DB, log *logger.Logger, cfg *config.Config) *DataHandler {
 	return &DataHandler{
-		db:     db,
-		logger: log,
-		cfg:    cfg,
+		db:            db,
+		logger:        log,
+		cfg:           cfg,
+		receiverConns: make(map[string]*websocket.Conn),
 	}
 }
 
@@ -46,9 +63,16 @@ func (h *DataHandler) RequestData(c *gin.Context) {
 	if request.ID == "" {
 		request.ID = uuid.New().String()
 	}
-	userID := c.GetString("user_id")
+	userIDInt, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found"})
+		return
+	}
+	userID := fmt.Sprintf("%d", userIDInt)
 	request.RequestedBy = userID
 	request.Timestamp = time.Now().Unix()
+	
+	h.logger.Debug("RequestData: userID=%s, request.RequestedBy=%s", userID, request.RequestedBy)
 
 	// Store request in database
 	if err := h.createDataRequest(&request); err != nil {
@@ -125,7 +149,12 @@ func (h *DataHandler) GetAvailableDownloads(c *gin.Context) {
 
 // ListRequests handles GET /api/data/requests
 func (h *DataHandler) ListRequests(c *gin.Context) {
-	userID := c.GetString("user_id")
+	userIDInt, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found"})
+		return
+	}
+	userID := fmt.Sprintf("%d", userIDInt)
 
 	requests, err := h.getDataRequestsByUser(userID)
 	if err != nil {
@@ -137,67 +166,83 @@ func (h *DataHandler) ListRequests(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"requests": requests})
 }
 
-// DownloadFile handles GET /api/data/download/:id
+// DownloadFile handles GET /api/data/download/:id/:station_id
 func (h *DataHandler) DownloadFile(c *gin.Context) {
 	requestID := c.Param("id")
+	stationID := c.Param("station_id")
+
 	if requestID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Request ID is required"})
 		return
 	}
 
-	// Get request status to verify it's ready and get file path
-	status, err := h.getDataRequestStatus(requestID)
+	if stationID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Station ID is required"})
+		return
+	}
+
+	// Get the specific collector response for this request and station
+	var response CollectorResponse
+	query := `
+		SELECT request_id, station_id, status, download_url, file_size
+		FROM collector_responses
+		WHERE request_id = ? AND station_id = ? AND status = 'ready'
+	`
+
+	var downloadURL sql.NullString
+	var fileSize sql.NullInt64
+
+	err := h.db.QueryRow(query, requestID, stationID).Scan(
+		&response.RequestID,
+		&response.StationID,
+		&response.Status,
+		&downloadURL,
+		&fileSize,
+	)
+
 	if err != nil {
 		if err == sql.ErrNoRows {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Request not found"})
+			c.JSON(http.StatusNotFound, gin.H{"error": "File not ready or not found"})
 			return
 		}
-		h.logger.Error("Failed to get request status: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get status"})
+		h.logger.Error("Failed to query collector response: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get file info"})
 		return
 	}
 
-	// Check if file is ready for download
-	if status.Status != "ready" {
-		c.JSON(http.StatusPreconditionFailed, gin.H{
-			"error": "File not ready for download",
-			"status": status.Status,
-		})
+	if !downloadURL.Valid || downloadURL.String == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Download URL not available"})
 		return
 	}
 
-	// Check if file path exists
-	if status.FilePath == "" {
-		c.JSON(http.StatusNotFound, gin.H{"error": "File path not available"})
+	// Proxy the request to the collector
+	h.logger.Info("Proxying download request for %s from station %s to %s", requestID, stationID, downloadURL.String)
+
+	// Create HTTP client and make request to collector
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(downloadURL.String)
+	if err != nil {
+		h.logger.Error("Failed to proxy download request: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Failed to download from collector"})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		h.logger.Error("Collector returned status %d for download", resp.StatusCode)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Collector download failed"})
 		return
 	}
 
-	// For now, return a mock file
-	// In a real implementation, this would stream the actual file from the collector
-	fileName := fmt.Sprintf("%s_data.npz", requestID)
-
-	// Set headers for file download
-	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", fileName))
+	// Set appropriate headers
 	c.Header("Content-Type", "application/octet-stream")
-	c.Header("Content-Length", fmt.Sprintf("%d", status.FileSize))
-
-	// Generate mock file data
-	mockData := fmt.Sprintf("# Mock SDR data file for request %s\n# Station: %s\n# File size: %d bytes\n# Generated at: %s\n",
-		requestID, status.StationID, status.FileSize, time.Now().Format(time.RFC3339))
-
-	// Pad to reach the expected file size
-	remainingSize := int(status.FileSize) - len(mockData)
-	if remainingSize > 0 {
-		padding := make([]byte, remainingSize)
-		for i := range padding {
-			padding[i] = byte(i % 256) // Simple pattern for mock data
-		}
-		mockData += string(padding)
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s_%s_data.npz\"", requestID, stationID))
+	if fileSize.Valid {
+		c.Header("Content-Length", fmt.Sprintf("%d", fileSize.Int64))
 	}
 
-	h.logger.Info("Serving download for request %s (%d bytes)", requestID, status.FileSize)
-
-	c.Data(http.StatusOK, "application/octet-stream", []byte(mockData))
+	// Copy the response body directly to the client
+	c.DataFromReader(http.StatusOK, resp.ContentLength, "application/octet-stream", resp.Body, nil)
 }
 
 // createDataRequest stores a new data request in the database
@@ -422,21 +467,28 @@ func (h *DataHandler) StoreCollectorResponse(requestID, stationID, status, fileP
 		return err
 	}
 
-	// Also update the main data_requests table if this is the first completion
+	// Send notification to receiver if data is ready
 	if status == "ready" {
-		// Check if this is the first collector to complete
-		var count int
-		countQuery := `
-			SELECT COUNT(*) FROM collector_responses
-			WHERE request_id = ? AND status = 'ready'
-		`
-		if err := h.db.QueryRow(countQuery, requestID).Scan(&count); err == nil && count == 1 {
-			// This is the first completion, update the main request status
-			h.UpdateDataRequestStatus(requestID, status, filePath, fileSize)
+		h.logger.Info("Timestamp: Sending WebSocket notification to receiver at %s", time.Now().Format("2006-01-02 15:04:05.000"))
+		if err := h.NotifyReceiverDataReady(requestID, stationID); err != nil {
+			h.logger.Error("Failed to notify receiver about ready data: %v", err)
+		} else {
+			h.logger.Info("Timestamp: WebSocket notification sent successfully at %s", time.Now().Format("2006-01-02 15:04:05.000"))
 		}
 	}
 
 	return nil
+}
+
+// UpdateCollectorResponseURL updates the download URL for a specific collector response
+func (h *DataHandler) UpdateCollectorResponseURL(requestID, stationID, downloadURL string) error {
+	query := `
+		UPDATE collector_responses
+		SET download_url = ?
+		WHERE request_id = ? AND station_id = ?
+	`
+	_, err := h.db.Exec(query, downloadURL, requestID, stationID)
+	return err
 }
 
 // GetCollectorResponses returns all collector responses for a request
@@ -574,4 +626,277 @@ func (h *DataHandler) UpdateCollectorHeartbeat(stationID string) error {
 	`
 	_, err := h.db.Exec(query, stationID)
 	return err
+}
+
+// ReceiverWebSocketHandler handles WebSocket connections for receivers
+func (h *DataHandler) ReceiverWebSocketHandler(c *gin.Context) {
+	// Authenticate manually for WebSocket connections
+	authHeader := c.GetHeader("Authorization")
+	if authHeader == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization header required"})
+		return
+	}
+
+	tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+	if tokenString == authHeader {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid authorization header format"})
+		return
+	}
+
+	claims, err := auth.ValidateToken(tokenString, h.cfg.Auth.JWTSecret)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+		return
+	}
+
+	// Check client type
+	if claims.ClientType != 2 {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied for client type"})
+		return
+	}
+
+	userID := fmt.Sprintf("%d", claims.UserID)
+	h.logger.Info("WebSocket authentication successful for user %s", claims.Email)
+
+	// Upgrade to WebSocket
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		h.logger.Error("Failed to upgrade WebSocket connection: %v", err)
+		return
+	}
+
+	h.logger.Info("WebSocket upgrade successful for user %s", userID)
+
+	// Don't set read deadline initially - let it be open
+	conn.SetWriteDeadline(time.Time{})  // No write deadline
+	conn.SetReadDeadline(time.Time{})   // No read deadline initially
+
+	// Set up ping/pong handler
+	conn.SetPongHandler(func(string) error {
+		h.logger.Debug("Received pong from user %s", userID)
+		return nil
+	})
+
+	h.connMutex.Lock()
+	h.receiverConns[userID] = conn
+	h.connMutex.Unlock()
+
+	h.logger.Info("Receiver WebSocket connected: %s", userID)
+
+	// Handle connection cleanup
+	defer func() {
+		h.connMutex.Lock()
+		delete(h.receiverConns, userID)
+		h.connMutex.Unlock()
+		conn.Close()
+		h.logger.Info("Receiver WebSocket disconnected: %s", userID)
+	}()
+
+	// Set up a ping/pong mechanism for connection monitoring
+	// The connection is primarily for sending notifications TO the client, not reading FROM it
+	
+	// Set up a channel to detect when connection is closed
+	connectionClosed := make(chan bool, 1)
+	
+	// Set up close handler
+	conn.SetCloseHandler(func(code int, text string) error {
+		h.logger.Debug("WebSocket close handler called for user %s: %d %s", userID, code, text)
+		connectionClosed <- true
+		return nil
+	})
+
+	// Start a ping/pong based connection monitor
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				h.logger.Error("Recovered from panic in WebSocket monitor for user %s: %v", userID, r)
+				connectionClosed <- true
+			}
+		}()
+		
+		pingTicker := time.NewTicker(30 * time.Second)
+		defer pingTicker.Stop()
+		
+		for {
+			select {
+			case <-pingTicker.C:
+				// Send ping to check if connection is still alive
+				conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					h.logger.Debug("Failed to send ping to user %s: %v", userID, err)
+					connectionClosed <- true
+					return
+				}
+				conn.SetWriteDeadline(time.Time{})
+				h.logger.Debug("Sent ping to user %s", userID)
+			}
+		}
+	}()
+
+	// Wait for connection to close
+	<-connectionClosed
+	h.logger.Debug("WebSocket connection monitoring ended for user %s", userID)
+}
+
+// NotifyReceiverDataReady sends a notification to a receiver when data is ready
+func (h *DataHandler) NotifyReceiverDataReady(requestID, stationID string) error {
+	// Get the user who made the request
+	userID, err := h.getUserForRequest(requestID)
+	if err != nil {
+		return fmt.Errorf("failed to get user for request: %w", err)
+	}
+
+	h.logger.Debug("NotifyReceiverDataReady: requestID=%s, stationID=%s, userID=%s", requestID, stationID, userID)
+
+	h.connMutex.RLock()
+	conn, exists := h.receiverConns[userID]
+	h.logger.Debug("WebSocket connections available: %v", func() []string {
+		var keys []string
+		for k := range h.receiverConns {
+			keys = append(keys, k)
+		}
+		return keys
+	}())
+	h.connMutex.RUnlock()
+
+	if !exists {
+		h.logger.Debug("No active WebSocket connection for user %s", userID)
+		return nil
+	}
+
+	notification := map[string]interface{}{
+		"type":       "data_ready",
+		"request_id": requestID,
+		"station_id": stationID,
+		"timestamp":  time.Now().Unix(),
+	}
+
+	// Set write deadline to avoid blocking
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	
+	if err := conn.WriteJSON(notification); err != nil {
+		h.logger.Error("Failed to send notification to user %s: %v", userID, err)
+		// Remove the connection if it's broken
+		h.connMutex.Lock()
+		delete(h.receiverConns, userID)
+		h.connMutex.Unlock()
+		return err
+	}
+	
+	// Clear write deadline
+	conn.SetWriteDeadline(time.Time{})
+
+	h.logger.Info("Sent data ready notification to user %s for request %s from station %s", userID, requestID, stationID)
+	return nil
+}
+
+// getUserForRequest retrieves the user ID for a given request ID
+func (h *DataHandler) getUserForRequest(requestID string) (string, error) {
+	query := `SELECT requested_by FROM data_requests WHERE id = ?`
+	var userID string
+	err := h.db.QueryRow(query, requestID).Scan(&userID)
+	h.logger.Debug("getUserForRequest: requestID=%s, userID=%s, err=%v", requestID, userID, err)
+	return userID, err
+}
+
+// NotifyReceiverOfICEOffer sends a WebSocket notification to a receiver about a new ICE offer
+func (h *DataHandler) NotifyReceiverOfICEOffer(userID int, sessionID, offerSDP string) error {
+	userIDStr := fmt.Sprintf("%d", userID)
+	
+	h.connMutex.RLock()
+	conn, exists := h.receiverConns[userIDStr]
+	h.connMutex.RUnlock()
+
+	if !exists {
+		h.logger.Debug("No active WebSocket connection for user %d", userID)
+		return nil
+	}
+
+	notification := map[string]interface{}{
+		"type":       "ice_offer",
+		"session_id": sessionID,
+		"offer_sdp":  offerSDP,
+		"timestamp":  time.Now().Unix(),
+	}
+
+	// Set write deadline to avoid blocking
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	
+	if err := conn.WriteJSON(notification); err != nil {
+		h.logger.Error("Failed to send ICE offer notification to user %d: %v", userID, err)
+		// Remove the connection if it's broken
+		h.connMutex.Lock()
+		delete(h.receiverConns, userIDStr)
+		h.connMutex.Unlock()
+		return err
+	}
+	
+	// Clear write deadline
+	conn.SetWriteDeadline(time.Time{})
+
+	h.logger.Info("Sent ICE offer notification to user %d for session %s", userID, sessionID)
+	return nil
+}
+
+// NotifyCollectorOfICEAnswer sends a WebSocket notification to a collector about a new ICE answer
+func (h *DataHandler) NotifyCollectorOfICEAnswer(stationID, sessionID, answerSDP string) error {
+	// We need to send this to the collector handler since collectors connect there
+	if h.collectorHandler != nil {
+		return h.collectorHandler.NotifyCollectorOfICEAnswer(stationID, sessionID, answerSDP)
+	}
+	
+	h.logger.Debug("CollectorHandler not available to send ICE answer notification")
+	return nil
+}
+
+// NotifyCollectorOfICECandidate sends a WebSocket notification to a collector about a new ICE candidate
+func (h *DataHandler) NotifyCollectorOfICECandidate(stationID, sessionID string, candidate *models.ICECandidate) error {
+	// We need to send this to the collector handler since collectors connect there
+	if h.collectorHandler != nil {
+		return h.collectorHandler.NotifyCollectorOfICECandidate(stationID, sessionID, candidate)
+	}
+	
+	h.logger.Debug("CollectorHandler not available to send ICE candidate notification")
+	return nil
+}
+
+// NotifyReceiverOfICECandidate sends a WebSocket notification to a receiver about a new ICE candidate
+func (h *DataHandler) NotifyReceiverOfICECandidate(userID int, sessionID string, candidate *models.ICECandidate) error {
+	userIDStr := fmt.Sprintf("%d", userID)
+	
+	h.connMutex.RLock()
+	conn, exists := h.receiverConns[userIDStr]
+	h.connMutex.RUnlock()
+
+	if !exists {
+		h.logger.Debug("No active WebSocket connection for user %d", userID)
+		return nil
+	}
+
+	notification := map[string]interface{}{
+		"type":          "ice_candidate",
+		"session_id":    sessionID,
+		"candidate":     candidate.Candidate,
+		"sdp_mline_index": candidate.SDPMLineIndex,
+		"sdp_mid":       candidate.SDPMid,
+		"timestamp":     time.Now().Unix(),
+	}
+
+	// Set write deadline to avoid blocking
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	
+	if err := conn.WriteJSON(notification); err != nil {
+		h.logger.Error("Failed to send ICE candidate notification to user %d: %v", userID, err)
+		// Remove the connection if it's broken
+		h.connMutex.Lock()
+		delete(h.receiverConns, userIDStr)
+		h.connMutex.Unlock()
+		return err
+	}
+	
+	// Clear write deadline
+	conn.SetWriteDeadline(time.Time{})
+
+	h.logger.Info("Sent ICE candidate notification to user %d for session %s", userID, sessionID)
+	return nil
 }

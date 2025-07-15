@@ -62,6 +62,8 @@ func Migrate(db *sql.DB) error {
 			initiator_client_type INTEGER NOT NULL,
 			target_client_type INTEGER NOT NULL,
 			status TEXT DEFAULT 'pending',
+			offer_sdp TEXT,
+			answer_sdp TEXT,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			FOREIGN KEY (initiator_user_id) REFERENCES users(id),
@@ -86,6 +88,7 @@ func Migrate(db *sql.DB) error {
 			station_id TEXT NOT NULL,
 			status TEXT NOT NULL,
 			file_path TEXT,
+			download_url TEXT,
 			file_size INTEGER,
 			error_message TEXT,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -152,6 +155,14 @@ func CleanupStaleConnections(db *sql.DB) error {
 
 	// Reset all connected clients to disconnected
 	if _, err := db.Exec("UPDATE type1_clients SET status = 'disconnected' WHERE status = 'connected'"); err != nil {
+		return err
+	}
+
+	// Clear all ICE sessions and candidates (they're all stale on server restart)
+	if _, err := db.Exec("DELETE FROM ice_candidates"); err != nil {
+		return err
+	}
+	if _, err := db.Exec("DELETE FROM ice_sessions"); err != nil {
 		return err
 	}
 

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"argus-sdr/internal/models"
 	"argus-sdr/internal/shared"
 	"argus-sdr/pkg/config"
 	"argus-sdr/pkg/logger"
@@ -198,29 +199,44 @@ func (h *CollectorHandler) handleDataResponse(collectorConn *CollectorConnection
 
 	h.logger.Info("Received data response from station %s: request %s, status %s",
 		collectorConn.StationID, response.RequestID, response.Status)
+	h.logger.Info("Timestamp: Received data_response from station %s at %s", collectorConn.StationID, time.Now().Format("2006-01-02 15:04:05.000"))
 
 	switch response.Status {
 	case "ready":
 		// Store the individual collector response
-		if err := h.dataHandler.StoreCollectorResponse(response.RequestID, response.StationID, response.Status, response.FilePath, response.FileSize, ""); err != nil {
+		h.logger.Info("Timestamp: Storing collector response at %s", time.Now().Format("2006-01-02 15:04:05.000"))
+		if err := h.dataHandler.StoreCollectorResponse(response.RequestID,
+			collectorConn.StationID, response.Status, response.FilePath, response.FileSize, ""); err != nil {
 			h.logger.Error("Failed to store collector response: %v", err)
 		} else {
-			h.logger.Info("Stored collector response from station %s for request %s", response.StationID, response.RequestID)
+			h.logger.Info("Timestamp: Collector response stored successfully at %s", time.Now().Format("2006-01-02 15:04:05.000"))
 		}
+
+		// Also store the download URL if provided
+		if response.DownloadURL != "" {
+			// Update the collector response with the download URL
+			if err := h.dataHandler.UpdateCollectorResponseURL(response.RequestID,
+				collectorConn.StationID, response.DownloadURL); err != nil {
+				h.logger.Error("Failed to update collector response URL: %v", err)
+			}
+		}
+
+		h.logger.Info("Stored ready response from station %s for request %s (file: %s, download: %s)",
+			collectorConn.StationID, response.RequestID, response.FilePath, response.DownloadURL)
+
 	case "error":
-		// Store the error response
-		errorMessage := response.Error
-		if errorMessage == "" {
-			errorMessage = "Unknown error from collector"
+		// Store error response
+		if err := h.dataHandler.StoreCollectorResponse(response.RequestID,
+			collectorConn.StationID, response.Status, "", 0, response.Error); err != nil {
+			h.logger.Error("Failed to store error response: %v", err)
 		}
-		if err := h.dataHandler.StoreCollectorResponse(response.RequestID, response.StationID, "error", "", 0, errorMessage); err != nil {
-			h.logger.Error("Failed to store collector error response: %v", err)
-		}
-	case "processing":
-		// Store processing status update
-		if err := h.dataHandler.StoreCollectorResponse(response.RequestID, response.StationID, "processing", "", 0, ""); err != nil {
-			h.logger.Error("Failed to store collector processing status: %v", err)
-		}
+
+		h.logger.Error("Collector %s reported error for request %s: %s",
+			collectorConn.StationID, response.RequestID, response.Error)
+
+	default:
+		h.logger.Warn("Unknown response status from station %s: %s",
+			collectorConn.StationID, response.Status)
 	}
 }
 
@@ -345,4 +361,103 @@ func (h *CollectorHandler) GetConnectedStations() []string {
 	}
 
 	return stations
+}
+
+// NotifyCollectorOfICEAnswer sends a WebSocket notification to a collector about a new ICE answer
+func (h *CollectorHandler) NotifyCollectorOfICEAnswer(stationID, sessionID, answerSDP string) error {
+	h.connectionsMux.RLock()
+	conn, exists := h.connections[stationID]
+	h.connectionsMux.RUnlock()
+
+	if !exists {
+		h.logger.Debug("No active collector connection for station %s", stationID)
+		return nil
+	}
+
+	notification := shared.WebSocketMessage{
+		Type: "ice_answer",
+		Payload: map[string]interface{}{
+			"session_id": sessionID,
+			"answer_sdp": answerSDP,
+			"timestamp":  time.Now().Unix(),
+		},
+	}
+
+	if err := h.sendMessage(conn.Conn, notification); err != nil {
+		h.logger.Error("Failed to send ICE answer notification to station %s: %v", stationID, err)
+		return err
+	}
+
+	h.logger.Info("Sent ICE answer notification to station %s for session %s", stationID, sessionID)
+	return nil
+}
+
+// NotifyCollectorOfICECandidate sends a WebSocket notification to a collector about a new ICE candidate
+func (h *CollectorHandler) NotifyCollectorOfICECandidate(stationID, sessionID string, candidate *models.ICECandidate) error {
+	h.connectionsMux.RLock()
+	conn, exists := h.connections[stationID]
+	h.connectionsMux.RUnlock()
+
+	if !exists {
+		h.logger.Debug("No active collector connection for station %s", stationID)
+		return nil
+	}
+
+	notification := shared.WebSocketMessage{
+		Type: "ice_candidate",
+		Payload: map[string]interface{}{
+			"session_id":      sessionID,
+			"candidate":       candidate.Candidate,
+			"sdp_mline_index": candidate.SDPMLineIndex,
+			"sdp_mid":         candidate.SDPMid,
+			"timestamp":       time.Now().Unix(),
+		},
+	}
+
+	if err := h.sendMessage(conn.Conn, notification); err != nil {
+		h.logger.Error("Failed to send ICE candidate notification to station %s: %v", stationID, err)
+		return err
+	}
+
+	h.logger.Info("Sent ICE candidate notification to station %s for session %s", stationID, sessionID)
+	return nil
+}
+
+// NotifyCollectorOfNewICESession sends a WebSocket notification to collectors about a new ICE session
+func (h *CollectorHandler) NotifyCollectorOfNewICESession(sessionID, requestType string, userID int, parameters string) error {
+	h.connectionsMux.RLock()
+	connections := make([]*CollectorConnection, 0, len(h.connections))
+	for _, conn := range h.connections {
+		connections = append(connections, conn)
+	}
+	h.connectionsMux.RUnlock()
+
+	if len(connections) == 0 {
+		h.logger.Debug("No active collector connections to notify about ICE session %s", sessionID)
+		return nil
+	}
+
+	notification := shared.WebSocketMessage{
+		Type: "new_ice_session",
+		Payload: map[string]interface{}{
+			"session_id":   sessionID,
+			"request_type": requestType,
+			"from_user":    userID,
+			"parameters":   parameters,
+			"timestamp":    time.Now().Unix(),
+		},
+	}
+
+	successCount := 0
+	for _, conn := range connections {
+		if err := h.sendMessage(conn.Conn, notification); err != nil {
+			h.logger.Error("Failed to send new ICE session notification to station %s: %v", conn.StationID, err)
+		} else {
+			h.logger.Debug("Sent new ICE session notification to station %s for session %s", conn.StationID, sessionID)
+			successCount++
+		}
+	}
+
+	h.logger.Info("Notified %d collectors about new ICE session: %s", successCount, sessionID)
+	return nil
 }

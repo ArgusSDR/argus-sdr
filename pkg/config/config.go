@@ -86,7 +86,7 @@ func Load() (*Config, error) {
 		Collector: CollectorConfig{
 			StationID:      getEnv("STATION_ID", ""),
 			DataDir:        getEnv("DATA_DIR", "./nice_data"),
-			ContainerImage: getEnv("CONTAINER_IMAGE", "argussdr/sdr-tdoa-df:release-0.3"),
+			ContainerImage: getEnv("CONTAINER_IMAGE", "argussdr/sdr-tdoa-df:release-0.4"),
 			APIServerURL:   getEnv("API_SERVER_URL", "http://localhost:8080"),
 		},
 

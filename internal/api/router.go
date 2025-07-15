@@ -25,7 +25,7 @@ func NewRouter(db *sql.DB, log *logger.Logger, cfg *config.Config) *gin.Engine {
 	type2Handler := handlers.NewType2Handler(db, log, cfg)
 	dataHandler := handlers.NewDataHandler(db, log, cfg)
 	collectorHandler := handlers.NewCollectorHandler(db, log, cfg, dataHandler)
-	iceHandler := handlers.NewICEHandler(db, log, cfg, type1Handler)
+	iceHandler := handlers.NewICEHandler(db, log, cfg, type1Handler, dataHandler, collectorHandler)
 
 	// Set up handler dependencies
 	dataHandler.SetCollectorHandler(collectorHandler)
@@ -75,7 +75,7 @@ func NewRouter(db *sql.DB, log *logger.Logger, cfg *config.Config) *gin.Engine {
 		data.GET("/status/:id", dataHandler.GetRequestStatus)
 		data.GET("/downloads/:id", dataHandler.GetAvailableDownloads)
 		data.GET("/requests", dataHandler.ListRequests)
-		data.GET("/download/:id", dataHandler.DownloadFile)
+		data.GET("/download/:id/:station_id", dataHandler.DownloadFile)
 
 		// Legacy Type 2 routes
 		data.GET("/spectrum", middleware.RequireClientType(2), type2Handler.GetSpectrum)
@@ -88,6 +88,9 @@ func NewRouter(db *sql.DB, log *logger.Logger, cfg *config.Config) *gin.Engine {
 
 	// WebSocket endpoint for collector clients (new modes system)
 	router.GET("/collector-ws", collectorHandler.WebSocketHandler)
+
+	// WebSocket endpoint for receiver clients to get data ready notifications
+	router.GET("/receiver-ws", dataHandler.ReceiverWebSocketHandler)
 
 	return router
 }

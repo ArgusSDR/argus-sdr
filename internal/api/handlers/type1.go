@@ -29,6 +29,7 @@ type WebSocketConnection struct {
 type ConnectionManager struct {
 	connections map[string]*WebSocketConnection
 	mutex       sync.RWMutex
+	log         *logger.Logger
 }
 
 // Global connection manager instance
@@ -44,6 +45,9 @@ type Type1Handler struct {
 }
 
 func NewType1Handler(db *sql.DB, log *logger.Logger, cfg *config.Config) *Type1Handler {
+	// Initialize the global connection manager with logger
+	connManager.log = log
+	
 	return &Type1Handler{
 		db:  db,
 		log: log,
@@ -58,9 +62,11 @@ func NewType1Handler(db *sql.DB, log *logger.Logger, cfg *config.Config) *Type1H
 
 // AddConnection adds a new WebSocket connection to the manager
 func (cm *ConnectionManager) AddConnection(connID string, conn *WebSocketConnection) {
+	cm.log.Debug("AddConnection: acquiring lock")
 	cm.mutex.Lock()
 	defer cm.mutex.Unlock()
 	cm.connections[connID] = conn
+	cm.log.Debug("AddConnection: released lock")
 }
 
 // RemoveConnection removes a WebSocket connection from the manager

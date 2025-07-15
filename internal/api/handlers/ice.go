@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
@@ -17,14 +18,16 @@ import (
 )
 
 type ICEHandler struct {
-	db          *sql.DB
-	log         *logger.Logger
-	cfg         *config.Config
-	api         *webrtc.API
-	type1Handler *Type1Handler
+	db               *sql.DB
+	log              *logger.Logger
+	cfg              *config.Config
+	api              *webrtc.API
+	type1Handler     *Type1Handler
+	dataHandler      *DataHandler
+	collectorHandler *CollectorHandler
 }
 
-func NewICEHandler(db *sql.DB, log *logger.Logger, cfg *config.Config, type1Handler *Type1Handler) *ICEHandler {
+func NewICEHandler(db *sql.DB, log *logger.Logger, cfg *config.Config, type1Handler *Type1Handler, dataHandler *DataHandler, collectorHandler *CollectorHandler) *ICEHandler {
 	// Create a MediaEngine object to configure the supported codec
 	m := &webrtc.MediaEngine{}
 
@@ -35,11 +38,13 @@ func NewICEHandler(db *sql.DB, log *logger.Logger, cfg *config.Config, type1Hand
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i))
 
 	return &ICEHandler{
-		db:           db,
-		log:          log,
-		cfg:          cfg,
-		api:          api,
-		type1Handler: type1Handler,
+		db:               db,
+		log:              log,
+		cfg:              cfg,
+		api:              api,
+		type1Handler:     type1Handler,
+		dataHandler:      dataHandler,
+		collectorHandler: collectorHandler,
 	}
 }
 
@@ -97,6 +102,12 @@ func (h *ICEHandler) InitiateSession(c *gin.Context) {
 		// Don't fail the request if notification fails
 	}
 
+	// Also notify collectors via the CollectorHandler
+	if err := h.collectorHandler.NotifyCollectorOfNewICESession(sessionID, "data", userID.(int), req.Parameters); err != nil {
+		h.log.Error("Failed to notify collectors about new ICE session: %v", err)
+		// Don't fail the request if notification fails
+	}
+
 	h.log.Info("ICE session initiated: session_id=%s, user_id=%v, request_type=data", sessionID, userID)
 
 	c.JSON(http.StatusCreated, models.FileTransferResponse{
@@ -122,11 +133,29 @@ func (h *ICEHandler) Signal(c *gin.Context) {
 	var initiatorUserID, targetUserID sql.NullInt64
 	var initiatorClientType, targetClientType int
 
-	err := h.db.QueryRow(`
-		SELECT 1, initiator_user_id, target_user_id, initiator_client_type, target_client_type
-		FROM ice_sessions
-		WHERE session_id = ? AND (initiator_user_id = ? OR target_user_id = ?)
-	`, req.SessionID, userID, userID).Scan(&sessionExists, &initiatorUserID, &targetUserID, &initiatorClientType, &targetClientType)
+	// For Type 1 clients (collectors), allow them to participate in sessions that target their client type
+	var query string
+	var args []interface{}
+
+	if clientType.(int) == 1 {
+		// Type 1 clients can participate in sessions targeting Type 1 clients
+		query = `
+			SELECT 1, initiator_user_id, target_user_id, initiator_client_type, target_client_type
+			FROM ice_sessions
+			WHERE session_id = ? AND target_client_type = 1
+		`
+		args = []interface{}{req.SessionID}
+	} else {
+		// Type 2 clients can only participate in sessions they initiated or are targeted for
+		query = `
+			SELECT 1, initiator_user_id, target_user_id, initiator_client_type, target_client_type
+			FROM ice_sessions
+			WHERE session_id = ? AND (initiator_user_id = ? OR target_user_id = ?)
+		`
+		args = []interface{}{req.SessionID, userID, userID}
+	}
+
+	err := h.db.QueryRow(query, args...).Scan(&sessionExists, &initiatorUserID, &targetUserID, &initiatorClientType, &targetClientType)
 
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Session not found or access denied"})
@@ -136,6 +165,19 @@ func (h *ICEHandler) Signal(c *gin.Context) {
 		h.log.Error("Failed to verify session: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return
+	}
+
+	// For Type 1 clients responding to a session, set them as the target
+	if clientType.(int) == 1 && !targetUserID.Valid {
+		_, err := h.db.Exec(`
+			UPDATE ice_sessions
+			SET target_user_id = ?, updated_at = CURRENT_TIMESTAMP
+			WHERE session_id = ?
+		`, userID, req.SessionID)
+		if err != nil {
+			h.log.Error("Failed to set target user for ICE session: %v", err)
+			// Don't fail the request, just log the error
+		}
 	}
 
 	switch req.Type {
@@ -171,16 +213,21 @@ func (h *ICEHandler) handleOffer(req models.ICESignalRequest, userID, clientType
 	// Store the offer
 	_, err := h.db.Exec(`
 		UPDATE ice_sessions
-		SET status = 'offer_received', updated_at = CURRENT_TIMESTAMP
+		SET status = 'offer_received', offer_sdp = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE session_id = ?
-	`, req.SessionID)
+	`, req.SessionDescription.SDP, req.SessionID)
 
 	if err != nil {
 		return err
 	}
 
-	// In a real implementation, you would notify the target client about the offer
-	// For now, we'll just log it
+	// Send WebSocket notification to receiver about the new offer
+	if h.dataHandler != nil {
+		if err := h.notifyReceiverOfOffer(req.SessionID, req.SessionDescription.SDP); err != nil {
+			h.log.Error("Failed to notify receiver of offer: %v", err)
+		}
+	}
+
 	h.log.Info("Offer received for session %s from user %d", req.SessionID, userID)
 
 	return nil
@@ -194,12 +241,19 @@ func (h *ICEHandler) handleAnswer(req models.ICESignalRequest, userID, clientTyp
 	// Store the answer
 	_, err := h.db.Exec(`
 		UPDATE ice_sessions
-		SET target_user_id = ?, status = 'answer_received', updated_at = CURRENT_TIMESTAMP
+		SET target_user_id = ?, status = 'answer_received', answer_sdp = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE session_id = ?
-	`, userID, req.SessionID)
+	`, userID, req.SessionDescription.SDP, req.SessionID)
 
 	if err != nil {
 		return err
+	}
+
+	// Send WebSocket notification to collector about the new answer
+	if h.dataHandler != nil {
+		if err := h.notifyCollectorOfAnswer(req.SessionID, req.SessionDescription.SDP); err != nil {
+			h.log.Error("Failed to notify collector of answer: %v", err)
+		}
 	}
 
 	h.log.Info("Answer received for session %s from user %d", req.SessionID, userID)
@@ -222,6 +276,13 @@ func (h *ICEHandler) handleICECandidate(req models.ICESignalRequest, userID int)
 		return err
 	}
 
+	// Send WebSocket notification to the other party about the new ICE candidate
+	if h.dataHandler != nil {
+		if err := h.notifyPeerOfICECandidate(req.SessionID, userID, req.ICECandidate); err != nil {
+			h.log.Error("Failed to notify peer of ICE candidate: %v", err)
+		}
+	}
+
 	h.log.Info("ICE candidate received for session %s from user %d", req.SessionID, userID)
 
 	return nil
@@ -231,13 +292,24 @@ func (h *ICEHandler) handleICECandidate(req models.ICESignalRequest, userID int)
 func (h *ICEHandler) GetSignals(c *gin.Context) {
 	sessionID := c.Param("session_id")
 	userID, _ := c.Get("user_id")
+	clientType, _ := c.Get("client_type")
 
-	// Verify session access
+	// Verify session access - allow Type 1 clients to access sessions targeting their client type
 	var sessionExists bool
-	err := h.db.QueryRow(`
-		SELECT 1 FROM ice_sessions
-		WHERE session_id = ? AND (initiator_user_id = ? OR target_user_id = ?)
-	`, sessionID, userID, userID).Scan(&sessionExists)
+	var query string
+	var args []interface{}
+
+	if clientType.(int) == 1 {
+		// Type 1 clients can access sessions targeting Type 1 clients
+		query = `SELECT 1 FROM ice_sessions WHERE session_id = ? AND target_client_type = 1`
+		args = []interface{}{sessionID}
+	} else {
+		// Type 2 clients can only access sessions they initiated or are targeted for
+		query = `SELECT 1 FROM ice_sessions WHERE session_id = ? AND (initiator_user_id = ? OR target_user_id = ?)`
+		args = []interface{}{sessionID, userID, userID}
+	}
+
+	err := h.db.QueryRow(query, args...).Scan(&sessionExists)
 
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Session not found or access denied"})
@@ -247,6 +319,32 @@ func (h *ICEHandler) GetSignals(c *gin.Context) {
 		h.log.Error("Failed to verify session: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return
+	}
+
+	// Get offer SDP if available and user is Type 2 (receiver)
+	var offerSDP sql.NullString
+	if clientType.(int) == 2 {
+		err = h.db.QueryRow(`
+			SELECT offer_sdp FROM ice_sessions WHERE session_id = ?
+		`, sessionID).Scan(&offerSDP)
+		if err != nil && err != sql.ErrNoRows {
+			h.log.Error("Failed to fetch offer SDP: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+			return
+		}
+	}
+
+	// Get answer SDP if available and user is Type 1 (collector)
+	var answerSDP sql.NullString
+	if clientType.(int) == 1 {
+		err = h.db.QueryRow(`
+			SELECT answer_sdp FROM ice_sessions WHERE session_id = ?
+		`, sessionID).Scan(&answerSDP)
+		if err != nil && err != sql.ErrNoRows {
+			h.log.Error("Failed to fetch answer SDP: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+			return
+		}
 	}
 
 	// Get ICE candidates for this session (excluding the current user's candidates)
@@ -276,10 +374,20 @@ func (h *ICEHandler) GetSignals(c *gin.Context) {
 		candidates = append(candidates, candidate)
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	response := gin.H{
 		"session_id": sessionID,
 		"candidates": candidates,
-	})
+	}
+	
+	if offerSDP.Valid {
+		response["offer_sdp"] = offerSDP.String
+	}
+	
+	if answerSDP.Valid {
+		response["answer_sdp"] = answerSDP.String
+	}
+
+	c.JSON(http.StatusOK, response)
 }
 
 // GetActiveSessions returns sessions that need peer connections
@@ -332,4 +440,95 @@ func (h *ICEHandler) GetActiveSessions(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"sessions": sessions,
 	})
+}
+
+// notifyReceiverOfOffer sends a WebSocket notification to the receiver about a new ICE offer
+func (h *ICEHandler) notifyReceiverOfOffer(sessionID, offerSDP string) error {
+	// Get the initiator user ID for this session (the receiver who initiated the request)
+	var initiatorUserID int
+	err := h.db.QueryRow(`
+		SELECT initiator_user_id FROM ice_sessions WHERE session_id = ?
+	`, sessionID).Scan(&initiatorUserID)
+	
+	if err != nil {
+		return err
+	}
+	
+	// Send WebSocket notification to the receiver
+	return h.dataHandler.NotifyReceiverOfICEOffer(initiatorUserID, sessionID, offerSDP)
+}
+
+// notifyCollectorOfAnswer sends a WebSocket notification to the collector about a new ICE answer
+func (h *ICEHandler) notifyCollectorOfAnswer(sessionID, answerSDP string) error {
+	// We need to find which collector should receive this answer
+	// The collector is identified by the station_id from the session parameters
+	var parameters string
+	err := h.db.QueryRow(`
+		SELECT ft.parameters FROM ice_sessions s
+		JOIN file_transfers ft ON s.session_id = ft.session_id
+		WHERE s.session_id = ?
+	`, sessionID).Scan(&parameters)
+	
+	if err != nil {
+		return err
+	}
+	
+	// Parse parameters to get station_id
+	var params map[string]interface{}
+	if err := json.Unmarshal([]byte(parameters), &params); err != nil {
+		return err
+	}
+	
+	stationID, ok := params["station_id"].(string)
+	if !ok {
+		return errors.New("station_id not found in session parameters")
+	}
+	
+	// Send WebSocket notification to the collector
+	return h.dataHandler.NotifyCollectorOfICEAnswer(stationID, sessionID, answerSDP)
+}
+
+// notifyPeerOfICECandidate sends a WebSocket notification about ICE candidates to the appropriate peer
+func (h *ICEHandler) notifyPeerOfICECandidate(sessionID string, senderUserID int, candidate *models.ICECandidate) error {
+	// Get session info to determine who should receive the candidate
+	var initiatorUserID, targetUserID sql.NullInt64
+	var initiatorClientType, targetClientType int
+	var parameters string
+	
+	err := h.db.QueryRow(`
+		SELECT s.initiator_user_id, s.target_user_id, s.initiator_client_type, s.target_client_type, ft.parameters
+		FROM ice_sessions s
+		JOIN file_transfers ft ON s.session_id = ft.session_id
+		WHERE s.session_id = ?
+	`, sessionID).Scan(&initiatorUserID, &targetUserID, &initiatorClientType, &targetClientType, &parameters)
+	
+	if err != nil {
+		return err
+	}
+	
+	// Determine who should receive this candidate (the other party)
+	if initiatorUserID.Valid && initiatorUserID.Int64 == int64(senderUserID) {
+		// Sender is initiator (receiver), so notify the target (collector)
+		if targetClientType == 1 { // Collector
+			// Parse parameters to get station_id
+			var params map[string]interface{}
+			if err := json.Unmarshal([]byte(parameters), &params); err != nil {
+				return err
+			}
+			
+			stationID, ok := params["station_id"].(string)
+			if !ok {
+				return errors.New("station_id not found in session parameters")
+			}
+			
+			return h.dataHandler.NotifyCollectorOfICECandidate(stationID, sessionID, candidate)
+		}
+	} else if targetUserID.Valid && targetUserID.Int64 == int64(senderUserID) {
+		// Sender is target (collector), so notify the initiator (receiver)
+		if initiatorClientType == 2 { // Receiver
+			return h.dataHandler.NotifyReceiverOfICECandidate(int(initiatorUserID.Int64), sessionID, candidate)
+		}
+	}
+	
+	return nil
 }
