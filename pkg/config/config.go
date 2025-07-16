@@ -59,7 +59,7 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		// Common
 		Mode:        getEnv("MODE", "api"),
-		Environment: getEnv("ENVIRONMENT", "development"),
+		Environment: getEnv("ENVIRONMENT", "production"),
 		LogLevel:    getEnv("LOG_LEVEL", "info"),
 
 		// API Server
@@ -68,7 +68,7 @@ func Load() (*Config, error) {
 			Port:    getEnvInt("SERVER_PORT", 8080),
 		},
 		Database: DatabaseConfig{
-			Path: getEnv("DATABASE_PATH", "./sdr.db"),
+			Path: getEnv("DATABASE_PATH", "/config/sdr.db"),
 		},
 		SSL: SSLConfig{
 			Enabled:  getEnvBool("SSL_ENABLED", false),

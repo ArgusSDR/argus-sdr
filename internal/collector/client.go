@@ -186,7 +186,7 @@ func (c *Client) stripProtocolAndSlash(url string) string {
 func (c *Client) connectWebSocket() error {
 	// Strip protocol and trailing slash from API server URL
 	cleanURL := c.stripProtocolAndSlash(c.APIServerURL)
-	url := fmt.Sprintf("ws://%s/collector-ws", cleanURL)
+	url := fmt.Sprintf("wss://%s/collector-ws", cleanURL)
 
 	dialer := websocket.DefaultDialer
 	conn, _, err := dialer.Dial(url, nil)
