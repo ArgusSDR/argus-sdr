@@ -7,12 +7,16 @@ import (
 	"argus-sdr/internal/api/middleware"
 	"argus-sdr/pkg/config"
 	"argus-sdr/pkg/logger"
+	"argus-sdr/pkg/metrics"
 
 	"github.com/gin-gonic/gin"
 )
 
 func NewRouter(db *sql.DB, log *logger.Logger, cfg *config.Config) *gin.Engine {
 	router := gin.New()
+
+	// Initialize metrics system
+	systemMetrics := metrics.NewSystemMetrics()
 
 	// Middleware
 	router.Use(middleware.Recovery(log))
@@ -32,14 +36,16 @@ func NewRouter(db *sql.DB, log *logger.Logger, cfg *config.Config) *gin.Engine {
 	dataHandler := handlers.NewDataHandler(db, log, cfg)
 	collectorHandler := handlers.NewCollectorHandler(db, log, cfg, dataHandler)
 	iceHandler := handlers.NewICEHandler(db, log, cfg, type1Handler, dataHandler, collectorHandler)
+	healthHandler := handlers.NewHealthHandler(db, log, cfg, systemMetrics)
 
 	// Set up handler dependencies
 	dataHandler.SetCollectorHandler(collectorHandler)
 
-	// Health check
-	router.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{"status": "ok"})
-	})
+	// Health monitoring endpoints
+	router.GET("/health", healthHandler.GetHealth)
+	router.GET("/metrics", healthHandler.GetMetrics) 
+	router.GET("/readiness", healthHandler.GetReadiness)
+	router.GET("/liveness", healthHandler.GetLiveness)
 	
 	// Version endpoint
 	router.GET("/version", func(c *gin.Context) {
