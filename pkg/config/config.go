@@ -68,7 +68,7 @@ func Load() (*Config, error) {
 			Port:    getEnvInt("SERVER_PORT", 8080),
 		},
 		Database: DatabaseConfig{
-			Path: getEnv("DATABASE_PATH", "/config/sdr.db"),
+			Path: getEnv("DATABASE_PATH", "./sdr.db"),
 		},
 		SSL: SSLConfig{
 			Enabled:  getEnvBool("SSL_ENABLED", false),

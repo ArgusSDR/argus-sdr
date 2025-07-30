@@ -34,6 +34,14 @@ func NewRouter(db *sql.DB, log *logger.Logger, cfg *config.Config) *gin.Engine {
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
+	
+	// Version endpoint
+	router.GET("/version", func(c *gin.Context) {
+		c.JSON(200, gin.H{
+			"version": "0.0.1",
+			"name":    "Argus SDR",
+		})
+	})
 
 	// API routes
 	api := router.Group("/api")
@@ -72,6 +80,7 @@ func NewRouter(db *sql.DB, log *logger.Logger, cfg *config.Config) *gin.Engine {
 	data.Use(middleware.RequireAuth(cfg))
 	{
 		data.POST("/request", dataHandler.RequestData)
+		data.POST("/request-ice", middleware.RequireClientType(2), dataHandler.RequestDataWithICE)
 		data.GET("/status/:id", dataHandler.GetRequestStatus)
 		data.GET("/downloads/:id", dataHandler.GetAvailableDownloads)
 		data.GET("/requests", dataHandler.ListRequests)

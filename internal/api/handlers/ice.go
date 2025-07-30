@@ -395,16 +395,36 @@ func (h *ICEHandler) GetActiveSessions(c *gin.Context) {
 	userID, _ := c.Get("user_id")
 	clientType, _ := c.Get("client_type")
 
-	// Get sessions where this user should be the target
-	rows, err := h.db.Query(`
-		SELECT s.session_id, s.initiator_user_id, s.status, s.created_at,
-			   ft.request_type, ft.parameters
-		FROM ice_sessions s
-		JOIN file_transfers ft ON s.session_id = ft.session_id
-		WHERE s.target_client_type = ? AND s.status IN ('pending', 'offer_received')
-		AND (s.target_user_id IS NULL OR s.target_user_id = ?)
-		ORDER BY s.created_at DESC
-	`, clientType, userID)
+	// Get sessions where this user is involved (as initiator or target)
+	var query string
+	var args []interface{}
+	
+	if clientType.(int) == 1 {
+		// Type 1 clients (collectors) see sessions targeting them
+		query = `
+			SELECT s.session_id, s.initiator_user_id, s.status, s.created_at,
+				   ft.request_type, ft.parameters
+			FROM ice_sessions s
+			JOIN file_transfers ft ON s.session_id = ft.session_id
+			WHERE s.target_client_type = 1 AND s.status IN ('pending', 'offer_received')
+			AND (s.target_user_id IS NULL OR s.target_user_id = ?)
+			ORDER BY s.created_at DESC
+		`
+		args = []interface{}{userID}
+	} else {
+		// Type 2 clients (receivers) see sessions they initiated
+		query = `
+			SELECT s.session_id, s.initiator_user_id, s.status, s.created_at,
+				   ft.request_type, ft.parameters
+			FROM ice_sessions s
+			JOIN file_transfers ft ON s.session_id = ft.session_id
+			WHERE s.initiator_user_id = ? AND s.status IN ('pending', 'offer_received', 'answer_received')
+			ORDER BY s.created_at DESC
+		`
+		args = []interface{}{userID}
+	}
+	
+	rows, err := h.db.Query(query, args...)
 
 	if err != nil {
 		h.log.Error("Failed to fetch active sessions: %v", err)

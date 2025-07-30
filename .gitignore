@@ -35,6 +35,7 @@ Thumbs.db
 
 # Project specific
 argus-sdr
+argus-sdr-*
 *.db
 *.sqlite
 *.sqlite3
@@ -45,6 +46,29 @@ certs/
 config/local.yaml
 config/production.yaml
 
+# Data directories
+nice_data/
+downloads/
+data/
+
+# Docker volumes
+docker-volumes/
+
+# Build artifacts
+dist/
+build/
+
+# Testing artifacts
+test-results/
+coverage.html
+coverage.out
+
+# Configuration files with secrets
+config.json
+config.yaml
+
 # Temporary files
 tmp/
 temp/
+*.tmp
+*.temp

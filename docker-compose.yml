@@ -1,0 +1,124 @@
+version: '3.8'
+
+services:
+  # API Server
+  api-server:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - SERVER_ADDRESS=:8080
+      - DATABASE_PATH=/data/sdr.db
+      - ENVIRONMENT=development
+      - LOG_LEVEL=info
+      - JWT_SECRET=test-secret-key-for-development
+    volumes:
+      - api_data:/data
+    command: ["./argus-sdr", "api"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - sdr-network
+
+  # Collector Station 1
+  collector-station-1:
+    build: .
+    depends_on:
+      api-server:
+        condition: service_healthy
+    environment:
+      - STATION_ID=station-001
+      - API_SERVER_URL=http://api-server:8080
+      - DATA_DIR=/data
+      - CONTAINER_IMAGE=argussdr/sdr-tdoa-df:release-0.4
+    volumes:
+      - collector1_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock  # For Docker-in-Docker
+    command: ["./argus-sdr", "collector"]
+    networks:
+      - sdr-network
+
+  # Collector Station 2
+  collector-station-2:
+    build: .
+    depends_on:
+      api-server:
+        condition: service_healthy
+    environment:
+      - STATION_ID=station-002
+      - API_SERVER_URL=http://api-server:8080
+      - DATA_DIR=/data
+      - CONTAINER_IMAGE=argussdr/sdr-tdoa-df:release-0.4
+    volumes:
+      - collector2_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock  # For Docker-in-Docker
+    command: ["./argus-sdr", "collector"]
+    networks:
+      - sdr-network
+
+  # Collector Station 3
+  collector-station-3:
+    build: .
+    depends_on:
+      api-server:
+        condition: service_healthy
+    environment:
+      - STATION_ID=station-003
+      - API_SERVER_URL=http://api-server:8080
+      - DATA_DIR=/data
+      - CONTAINER_IMAGE=argussdr/sdr-tdoa-df:release-0.4
+    volumes:
+      - collector3_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock  # For Docker-in-Docker
+    command: ["./argus-sdr", "collector"]
+    networks:
+      - sdr-network
+
+  # Test Receiver Client (runs interactively)
+  receiver-client:
+    build: .
+    depends_on:
+      api-server:
+        condition: service_healthy
+    environment:
+      - RECEIVER_ID=test-receiver-001
+      - API_SERVER_URL=http://api-server:8080
+      - DOWNLOAD_DIR=/downloads
+    volumes:
+      - receiver_downloads:/downloads
+    stdin_open: true
+    tty: true
+    command: ["./argus-sdr", "receiver"]
+    networks:
+      - sdr-network
+    profiles:
+      - testing  # Only start when explicitly requested
+
+  # Database management utility
+  db-admin:
+    build: .
+    depends_on:
+      - api-server
+    environment:
+      - DATABASE_PATH=/data/sdr.db
+    volumes:
+      - api_data:/data
+    command: ["sleep", "infinity"]  # Keep container running for manual db access
+    networks:
+      - sdr-network
+    profiles:
+      - admin  # Only start when explicitly requested
+
+volumes:
+  api_data:
+  collector1_data:
+  collector2_data:
+  collector3_data:
+  receiver_downloads:
+
+networks:
+  sdr-network:
+    driver: bridge

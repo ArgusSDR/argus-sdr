@@ -1,0 +1,32 @@
+# Git
+.git
+.gitignore
+
+# Documentation
+*.md
+
+# Test files
+scripts/
+*test*
+
+# Build artifacts
+argus-sdr
+*.exe
+
+# Data directories
+nice_data/
+downloads/
+*.db
+
+# Docker files
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db

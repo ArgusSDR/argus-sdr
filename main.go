@@ -20,6 +20,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const Version = "0.0.1"
+
 var (
 	serverMode   string
 	serverPort   int
@@ -32,8 +34,9 @@ var (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "argus-sdr",
-	Short: "SDR API system with three operational modes",
+	Use:     "argus-sdr",
+	Short:   "SDR API system with three operational modes",
+	Version: Version,
 	Long: `Argus SDR system supports three operational modes:
 - api: Run the REST API server (default)
 - collector: Run the SDR data collection client

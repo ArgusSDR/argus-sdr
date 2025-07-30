@@ -94,6 +94,64 @@ func (h *DataHandler) RequestData(c *gin.Context) {
 	})
 }
 
+// RequestDataWithICE handles POST /api/data/request-ice for direct P2P file transfer
+func (h *DataHandler) RequestDataWithICE(c *gin.Context) {
+	var request struct {
+		shared.DataRequest
+		UseICE    bool   `json:"use_ice" binding:"required"`
+		StationID string `json:"station_id,omitempty"`
+	}
+	
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if !request.UseICE {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ICE direct transfer must be enabled for this endpoint"})
+		return
+	}
+
+	userIDInt, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found"})
+		return
+	}
+
+	// Generate unique request ID if not provided
+	if request.ID == "" {
+		request.ID = uuid.New().String()
+	}
+	
+	userID := fmt.Sprintf("%d", userIDInt)
+	request.RequestedBy = userID
+	request.Timestamp = time.Now().Unix()
+
+	// Store the data request
+	if err := h.createDataRequest(&request.DataRequest); err != nil {
+		h.logger.Error("Failed to create data request: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create request"})
+		return
+	}
+
+	// Create ICE session for direct P2P transfer
+	sessionID, err := h.createICESessionForDataRequest(request.ID, userIDInt.(int), request.StationID, request.DataRequest)
+	if err != nil {
+		h.logger.Error("Failed to create ICE session: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create ICE session"})
+		return
+	}
+
+	h.logger.Info("ICE-enabled data request created: request_id=%s, session_id=%s", request.ID, sessionID)
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"request_id": request.ID,
+		"session_id": sessionID,
+		"status":     "ice_session_created",
+		"message":    "ICE session created for direct P2P file transfer",
+	})
+}
+
 // GetRequestStatus handles GET /api/data/status/:id
 func (h *DataHandler) GetRequestStatus(c *gin.Context) {
 	requestID := c.Param("id")
@@ -899,4 +957,61 @@ func (h *DataHandler) NotifyReceiverOfICECandidate(userID int, sessionID string,
 
 	h.logger.Info("Sent ICE candidate notification to user %d for session %s", userID, sessionID)
 	return nil
+}
+
+// createICESessionForDataRequest creates an ICE session linked to a data request for direct P2P transfer
+func (h *DataHandler) createICESessionForDataRequest(requestID string, userID int, stationID string, dataRequest shared.DataRequest) (string, error) {
+	sessionID := uuid.New().String()
+	
+	// Create ICE session record - Type2 client (receiver) initiating session with Type1 client (collector)
+	_, err := h.db.Exec(`
+		INSERT INTO ice_sessions (session_id, initiator_user_id, initiator_client_type, target_client_type, status)
+		VALUES (?, ?, 2, 1, 'pending')
+	`, sessionID, userID)
+	
+	if err != nil {
+		return "", fmt.Errorf("failed to create ICE session: %v", err)
+	}
+	
+	// Create parameters JSON by combining the original parameters with ICE-specific data
+	parametersJSON := fmt.Sprintf(`{
+		"request_id": "%s",
+		"request_type": "%s",
+		"station_id": "%s",
+		"ice_enabled": true,
+		"original_parameters": %s
+	}`, requestID, dataRequest.RequestType, stationID, dataRequest.Parameters)
+	
+	// Create file transfer record linked to the data request
+	_, err = h.db.Exec(`
+		INSERT INTO file_transfers (session_id, file_name, file_size, file_type, request_type, parameters)
+		VALUES (?, ?, 0, 'application/octet-stream', ?, ?)
+	`, sessionID, fmt.Sprintf("%s_data.npz", requestID), dataRequest.RequestType, parametersJSON)
+	
+	if err != nil {
+		return "", fmt.Errorf("failed to create file transfer record: %v", err)
+	}
+	
+	// Link the data request to the ICE session for future reference
+	_, err = h.db.Exec(`
+		UPDATE data_requests 
+		SET status = 'ice_session_created'
+		WHERE id = ?
+	`, requestID)
+	
+	if err != nil {
+		h.logger.Error("Failed to update data request status: %v", err)
+		// Don't fail the entire operation for this
+	}
+	
+	// If station ID is provided, notify that specific collector about the ICE session
+	if stationID != "" && h.collectorHandler != nil {
+		if err := h.collectorHandler.NotifyCollectorOfNewICESession(sessionID, dataRequest.RequestType, userID, parametersJSON); err != nil {
+			h.logger.Error("Failed to notify collector %s about new ICE session: %v", stationID, err)
+			// Don't fail the entire operation for this
+		}
+	}
+	
+	h.logger.Info("Created ICE session %s for data request %s targeting station %s", sessionID, requestID, stationID)
+	return sessionID, nil
 }
