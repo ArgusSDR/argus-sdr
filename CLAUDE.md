@@ -37,6 +37,7 @@ docker-compose up -d api-server collector-station-1               # Minimal setu
 ./scripts/test-modes.sh                 # Test all three operational modes
 ./scripts/test-ice-integration.sh       # Test WebRTC P2P transfers
 ./scripts/test-docker-setup.sh         # Test Docker deployment
+./scripts/test-logging.sh               # Test enhanced logging system
 ./scripts/test-api.sh                   # Test API endpoints
 ./scripts/test-receiver.sh              # Test receiver functionality
 
@@ -45,6 +46,9 @@ go test ./...
 
 # Manual testing with different server ports
 SERVER_ADDRESS=:8081 ./argus-sdr api
+
+# Debug logging for development
+ENVIRONMENT=development LOG_LEVEL=debug ./argus-sdr api
 ```
 
 ### Database Operations
@@ -127,6 +131,21 @@ Messages use the `shared.WebSocketMessage` structure with `Type` and `Payload` f
 
 ### Database Changes
 All schema changes go through the migration system in `database.Migrate()`. Add new migrations to the `migrations` slice - never modify existing migrations.
+
+### Logging System
+The project uses structured logging with multiple levels:
+- **Development Mode**: Detailed request/response logging via `RequestLogger` middleware
+- **Production Mode**: Standard request logging via `Logger` middleware
+- **Log Levels**: DEBUG, INFO, WARN, ERROR with contextual information
+- **Security**: Sensitive data (passwords) automatically sanitized in logs
+- **Context**: User ID, client type, and IP addresses included in relevant logs
+
+Key logging features:
+- Authentication events (successful/failed logins, registrations)
+- WebSocket connection lifecycle (connect, disconnect, message handling)
+- API request timing and status codes
+- Data request processing and collector interactions
+- ICE session management activities
 
 ### Error Handling
 Use structured logging via `pkg/logger` with severity levels. Database errors, WebSocket connection issues, and Docker execution failures should be logged with context.

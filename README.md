@@ -262,14 +262,14 @@ docker run --rm -v argus-sdr_api_data:/data alpine tar czf - /data > backup.tar.
 
 ### System Components
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Receiver      │    │   API Server    │    │   Collector     │
+┌─────────────────┐    ┌─────────────────┐     ┌─────────────────┐
+│   Receiver      │    │   API Server    │     │   Collector     │
 │   Clients       │◄──►│                 │◄──►│   Stations      │
-│                 │    │  - Auth/DB      │    │                 │
-│  - Data Requests│    │  - WebSockets   │    │  - Data Proc    │
-│  - File Downloads│    │  - ICE Sessions │    │  - File Serving │
-│  - ICE P2P      │◄───┼─────────────────┼───►│  - ICE P2P      │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
+│                 │    │  - Auth/DB      │     │                 │
+│ - Data Requests │    │  - WebSockets   │     │  - Data Proc    │
+│ - File Downloads│    │  - ICE Sessions │     │  - File Serving │
+│ - ICE P2P       │◄───┼─────────────────┼───►│  - ICE P2P      │
+└─────────────────┘    └─────────────────┘     └─────────────────┘
 ```
 
 ### Data Flow Options

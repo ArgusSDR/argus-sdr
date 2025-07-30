@@ -30,14 +30,19 @@ func NewAuthHandler(db *sql.DB, log *logger.Logger, cfg *config.Config) *AuthHan
 func (h *AuthHandler) Register(c *gin.Context) {
 	var req models.RegisterRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		h.log.Warn("Invalid registration request from %s: %v", c.ClientIP(), err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+
+	h.log.Info("User registration attempt: email=%s client_type=%d from_ip=%s", 
+		req.Email, req.ClientType, c.ClientIP())
 
 	// Check if user already exists
 	var existingID int
 	err := h.db.QueryRow("SELECT id FROM users WHERE email = ?", req.Email).Scan(&existingID)
 	if err != sql.ErrNoRows {
+		h.log.Warn("Registration failed: email=%s already exists from_ip=%s", req.Email, c.ClientIP())
 		c.JSON(http.StatusConflict, gin.H{"error": "User already exists"})
 		return
 	}
@@ -79,6 +84,9 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		UpdatedAt:  time.Now(),
 	}
 
+	h.log.Info("User registered successfully: email=%s id=%d client_type=%d from_ip=%s", 
+		req.Email, userID, req.ClientType, c.ClientIP())
+
 	c.JSON(http.StatusCreated, models.AuthResponse{
 		Token: token,
 		User:  user,
@@ -100,6 +108,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.ClientType, &user.CreatedAt, &user.UpdatedAt)
 
 	if err == sql.ErrNoRows {
+		h.log.Warn("Failed login attempt: email=%s from_ip=%s (user not found)", req.Email, c.ClientIP())
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
@@ -111,6 +120,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 
 	// Check password
 	if !auth.CheckPasswordHash(req.Password, user.PasswordHash) {
+		h.log.Warn("Failed login attempt: email=%s from_ip=%s (invalid password)", req.Email, c.ClientIP())
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
@@ -118,10 +128,13 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	// Generate token
 	token, err := auth.GenerateToken(user.ID, user.Email, user.ClientType, h.cfg.Auth.JWTSecret, h.cfg.Auth.TokenExpiry)
 	if err != nil {
-		h.log.Error("Failed to generate token: %v", err)
+		h.log.Error("Failed to generate token for user %s: %v", req.Email, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
 		return
 	}
+
+	h.log.Info("User logged in successfully: email=%s id=%d client_type=%d from_ip=%s", 
+		user.Email, user.ID, user.ClientType, c.ClientIP())
 
 	c.JSON(http.StatusOK, models.AuthResponse{
 		Token: token,

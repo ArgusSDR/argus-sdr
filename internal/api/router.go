@@ -15,9 +15,15 @@ func NewRouter(db *sql.DB, log *logger.Logger, cfg *config.Config) *gin.Engine {
 	router := gin.New()
 
 	// Middleware
-	router.Use(middleware.Logger(log))
 	router.Use(middleware.Recovery(log))
 	router.Use(middleware.CORS())
+	
+	// Enhanced request logging based on environment
+	if cfg.Environment == "development" {
+		router.Use(middleware.RequestLogger(log)) // Detailed logging for development
+	} else {
+		router.Use(middleware.Logger(log)) // Standard logging for production
+	}
 
 	// Initialize handlers
 	authHandler := handlers.NewAuthHandler(db, log, cfg)

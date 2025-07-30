@@ -49,32 +49,39 @@ func NewCollectorHandler(db *sql.DB, log *logger.Logger, cfg *config.Config, dat
 
 // WebSocketHandler handles WebSocket connections from collector clients
 func (h *CollectorHandler) WebSocketHandler(c *gin.Context) {
+	clientIP := c.ClientIP()
+	h.logger.Info("WebSocket connection attempt from collector at %s", clientIP)
+	
 	// Upgrade HTTP connection to WebSocket
 	conn, err := h.upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		h.logger.Error("Failed to upgrade connection: %v", err)
+		h.logger.Error("Failed to upgrade WebSocket connection from %s: %v", clientIP, err)
 		return
 	}
 	defer conn.Close()
 
+	h.logger.Debug("WebSocket connection upgraded successfully for %s", clientIP)
+
 	// Handle initial authentication/registration
 	collectorConn, err := h.handleCollectorAuth(conn)
 	if err != nil {
-		h.logger.Error("Collector authentication failed: %v", err)
+		h.logger.Error("Collector authentication failed from %s: %v", clientIP, err)
 		return
 	}
 
 	// Register the connection
 	h.connectionsMux.Lock()
 	h.connections[collectorConn.StationID] = collectorConn
+	activeConnections := len(h.connections)
 	h.connectionsMux.Unlock()
 
 	// Register collector session in database
 	if err := h.dataHandler.RegisterCollectorSession(collectorConn.StationID); err != nil {
-		h.logger.Error("Failed to register collector session: %v", err)
+		h.logger.Error("Failed to register collector session for %s: %v", collectorConn.StationID, err)
 	}
 
-	h.logger.Info("Station connected: %s", collectorConn.StationID)
+	h.logger.Info("Collector connected: station=%s ip=%s total_active=%d", 
+		collectorConn.StationID, clientIP, activeConnections)
 
 	// Handle messages
 	defer h.cleanupConnection(collectorConn.StationID)
@@ -152,20 +159,29 @@ func (h *CollectorHandler) handleCollectorAuth(conn *websocket.Conn) (*Collector
 
 // handleMessages processes incoming messages from a collector
 func (h *CollectorHandler) handleMessages(collectorConn *CollectorConnection) {
+	h.logger.Debug("Starting message handling for collector %s", collectorConn.StationID)
+	
 	for {
 		messageType, message, err := collectorConn.Conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				h.logger.Error("WebSocket error: %v", err)
+				h.logger.Error("WebSocket unexpected close from collector %s: %v", collectorConn.StationID, err)
+			} else {
+				h.logger.Debug("Collector %s connection closed: %v", collectorConn.StationID, err)
 			}
 			break
 		}
 
 		if messageType == websocket.TextMessage {
 			collectorConn.LastSeen = time.Now()
+			h.logger.Debug("Received message from collector %s: %s", collectorConn.StationID, string(message))
 			h.processMessage(collectorConn, message)
+		} else {
+			h.logger.Warn("Received non-text message from collector %s (type: %d)", collectorConn.StationID, messageType)
 		}
 	}
+	
+	h.logger.Debug("Message handling ended for collector %s", collectorConn.StationID)
 }
 
 // processMessage handles incoming messages from collectors
@@ -173,18 +189,24 @@ func (h *CollectorHandler) processMessage(collectorConn *CollectorConnection, me
 	var wsMsg shared.WebSocketMessage
 	if err := json.Unmarshal(message, &wsMsg); err != nil {
 		h.logger.Error("Failed to unmarshal message from collector %s: %v", collectorConn.StationID, err)
+		h.logger.Debug("Invalid message content: %s", string(message))
 		return
 	}
 
+	h.logger.Debug("Processing message type '%s' from collector %s", wsMsg.Type, collectorConn.StationID)
+
 	switch wsMsg.Type {
 	case "data_response":
+		h.logger.Debug("Handling data response from collector %s", collectorConn.StationID)
 		h.handleDataResponse(collectorConn, wsMsg)
 	case "heartbeat":
+		h.logger.Debug("Handling heartbeat from collector %s", collectorConn.StationID)
 		h.handleHeartbeat(collectorConn, wsMsg)
 	case "heartbeat_response":
+		h.logger.Debug("Handling heartbeat response from collector %s", collectorConn.StationID)
 		h.handleHeartbeatResponse(collectorConn, wsMsg)
 	default:
-		h.logger.Warn("Unknown message type from collector %s: %s", collectorConn.StationID, wsMsg.Type)
+		h.logger.Warn("Unknown message type '%s' from collector %s", wsMsg.Type, collectorConn.StationID)
 	}
 }
 
@@ -335,7 +357,11 @@ func (h *CollectorHandler) sendMessage(conn *websocket.Conn, message shared.WebS
 func (h *CollectorHandler) cleanupConnection(stationID string) {
 	h.connectionsMux.Lock()
 	delete(h.connections, stationID)
+	remainingConnections := len(h.connections)
 	h.connectionsMux.Unlock()
+
+	h.logger.Info("Collector disconnected: station=%s remaining_active=%d", 
+		stationID, remainingConnections)
 
 	// Update database status
 	query := `

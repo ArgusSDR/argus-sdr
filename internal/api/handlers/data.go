@@ -55,6 +55,7 @@ func NewDataHandler(db *sql.DB, log *logger.Logger, cfg *config.Config) *DataHan
 func (h *DataHandler) RequestData(c *gin.Context) {
 	var request shared.DataRequest
 	if err := c.ShouldBindJSON(&request); err != nil {
+		h.logger.Warn("Invalid data request from %s: %v", c.ClientIP(), err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -65,6 +66,7 @@ func (h *DataHandler) RequestData(c *gin.Context) {
 	}
 	userIDInt, exists := c.Get("user_id")
 	if !exists {
+		h.logger.Error("User ID not found in context for data request")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found"})
 		return
 	}
@@ -72,11 +74,12 @@ func (h *DataHandler) RequestData(c *gin.Context) {
 	request.RequestedBy = userID
 	request.Timestamp = time.Now().Unix()
 	
-	h.logger.Debug("RequestData: userID=%s, request.RequestedBy=%s", userID, request.RequestedBy)
+	h.logger.Info("Data request submitted: id=%s type=%s by_user=%s from_ip=%s", 
+		request.ID, request.RequestType, userID, c.ClientIP())
 
 	// Store request in database
 	if err := h.createDataRequest(&request); err != nil {
-		h.logger.Error("Failed to create data request: %v", err)
+		h.logger.Error("Failed to create data request %s: %v", request.ID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create request"})
 		return
 	}
@@ -688,42 +691,50 @@ func (h *DataHandler) UpdateCollectorHeartbeat(stationID string) error {
 
 // ReceiverWebSocketHandler handles WebSocket connections for receivers
 func (h *DataHandler) ReceiverWebSocketHandler(c *gin.Context) {
+	clientIP := c.ClientIP()
+	h.logger.Info("Receiver WebSocket connection attempt from %s", clientIP)
+	
 	// Authenticate manually for WebSocket connections
 	authHeader := c.GetHeader("Authorization")
 	if authHeader == "" {
+		h.logger.Warn("WebSocket connection from %s rejected: missing auth header", clientIP)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization header required"})
 		return
 	}
 
 	tokenString := strings.TrimPrefix(authHeader, "Bearer ")
 	if tokenString == authHeader {
+		h.logger.Warn("WebSocket connection from %s rejected: invalid auth format", clientIP)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid authorization header format"})
 		return
 	}
 
 	claims, err := auth.ValidateToken(tokenString, h.cfg.Auth.JWTSecret)
 	if err != nil {
+		h.logger.Warn("WebSocket connection from %s rejected: invalid token - %v", clientIP, err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
 		return
 	}
 
 	// Check client type
 	if claims.ClientType != 2 {
+		h.logger.Warn("WebSocket connection from %s rejected: invalid client type %d", clientIP, claims.ClientType)
 		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied for client type"})
 		return
 	}
 
 	userID := fmt.Sprintf("%d", claims.UserID)
-	h.logger.Info("WebSocket authentication successful for user %s", claims.Email)
+	h.logger.Info("Receiver WebSocket authentication successful: user=%s email=%s ip=%s", 
+		userID, claims.Email, clientIP)
 
 	// Upgrade to WebSocket
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		h.logger.Error("Failed to upgrade WebSocket connection: %v", err)
+		h.logger.Error("Failed to upgrade receiver WebSocket from %s: %v", clientIP, err)
 		return
 	}
 
-	h.logger.Info("WebSocket upgrade successful for user %s", userID)
+	h.logger.Info("Receiver WebSocket connected: user=%s ip=%s", userID, clientIP)
 
 	// Don't set read deadline initially - let it be open
 	conn.SetWriteDeadline(time.Time{})  // No write deadline
@@ -737,17 +748,19 @@ func (h *DataHandler) ReceiverWebSocketHandler(c *gin.Context) {
 
 	h.connMutex.Lock()
 	h.receiverConns[userID] = conn
+	totalConnections := len(h.receiverConns)
 	h.connMutex.Unlock()
 
-	h.logger.Info("Receiver WebSocket connected: %s", userID)
+	h.logger.Info("Receiver WebSocket registered: user=%s total_receivers=%d", userID, totalConnections)
 
 	// Handle connection cleanup
 	defer func() {
 		h.connMutex.Lock()
 		delete(h.receiverConns, userID)
+		remainingConnections := len(h.receiverConns)
 		h.connMutex.Unlock()
 		conn.Close()
-		h.logger.Info("Receiver WebSocket disconnected: %s", userID)
+		h.logger.Info("Receiver WebSocket disconnected: user=%s remaining_receivers=%d", userID, remainingConnections)
 	}()
 
 	// Set up a ping/pong mechanism for connection monitoring
