@@ -3,7 +3,9 @@ package handlers
 import (
 	"database/sql"
 	"fmt"
+	"math"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +15,9 @@ import (
 	"argus-sdr/internal/shared"
 	"argus-sdr/pkg/config"
 	"argus-sdr/pkg/logger"
+	"argus-sdr/pkg/progress"
+	"argus-sdr/pkg/selection"
+	"argus-sdr/pkg/transfer"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -20,12 +25,15 @@ import (
 )
 
 type DataHandler struct {
-	db               *sql.DB
-	logger           *logger.Logger
-	cfg              *config.Config
-	collectorHandler *CollectorHandler
-	receiverConns    map[string]*websocket.Conn
-	connMutex        sync.RWMutex
+	db                *sql.DB
+	logger            *logger.Logger
+	cfg               *config.Config
+	collectorHandler  *CollectorHandler
+	receiverConns     map[string]*websocket.Conn
+	connMutex         sync.RWMutex
+	transferOptimizer *transfer.TransferOptimizer
+	collectorSelector *selection.CollectorSelector
+	progressTracker   *progress.ProgressTracker
 }
 
 var upgrader = websocket.Upgrader{
@@ -43,11 +51,23 @@ func (h *DataHandler) SetCollectorHandler(collectorHandler *CollectorHandler) {
 }
 
 func NewDataHandler(db *sql.DB, log *logger.Logger, cfg *config.Config) *DataHandler {
+	// Initialize transfer optimizer with default options
+	transferOptimizer := transfer.NewTransferOptimizer(log, transfer.GetDefaultOptions())
+	
+	// Initialize collector selector with load-balanced strategy
+	collectorSelector := selection.NewCollectorSelector(log, selection.StrategyLoadBalanced)
+	
+	// Initialize progress tracker
+	progressTracker := progress.NewProgressTracker(log)
+	
 	return &DataHandler{
-		db:            db,
-		logger:        log,
-		cfg:           cfg,
-		receiverConns: make(map[string]*websocket.Conn),
+		db:                db,
+		logger:            log,
+		cfg:               cfg,
+		receiverConns:     make(map[string]*websocket.Conn),
+		transferOptimizer: transferOptimizer,
+		collectorSelector: collectorSelector,
+		progressTracker:   progressTracker,
 	}
 }
 
@@ -306,6 +326,259 @@ func (h *DataHandler) DownloadFile(c *gin.Context) {
 	c.DataFromReader(http.StatusOK, resp.ContentLength, "application/octet-stream", resp.Body, nil)
 }
 
+// DownloadFileOptimized handles GET /api/data/download-optimized/:id/:station_id
+// This endpoint provides optimized file downloads with compression and verification
+func (h *DataHandler) DownloadFileOptimized(c *gin.Context) {
+	requestID := c.Param("id")
+	stationID := c.Param("station_id")
+	
+	if requestID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Request ID is required"})
+		return
+	}
+	if stationID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Station ID is required"})
+		return
+	}
+
+	// Get the specific collector response for this request and station
+	var response CollectorResponse
+	query := `
+		SELECT request_id, station_id, status, download_url, file_size, file_path
+		FROM collector_responses
+		WHERE request_id = ? AND station_id = ? AND status = 'ready'
+	`
+	var downloadURL sql.NullString
+	var fileSize sql.NullInt64
+	var filePath sql.NullString
+	
+	err := h.db.QueryRow(query, requestID, stationID).Scan(
+		&response.RequestID,
+		&response.StationID,
+		&response.Status,
+		&downloadURL,
+		&fileSize,
+		&filePath,
+	)
+	
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "File not ready or not found"})
+			return
+		}
+		h.logger.Error("Failed to query collector response: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get file info"})
+		return
+	}
+
+	// Check if we have a local file path for optimization
+	if filePath.Valid && filePath.String != "" {
+		// Serve optimized local file
+		h.serveOptimizedFile(c, filePath.String, requestID, stationID)
+		return
+	}
+
+	// Fall back to proxy download if no local file path
+	if !downloadURL.Valid || downloadURL.String == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "No download available"})
+		return
+	}
+
+	// Proxy download with optimization
+	h.proxyOptimizedDownload(c, downloadURL.String, requestID, stationID, fileSize)
+}
+
+// serveOptimizedFile serves a local file with compression optimization
+func (h *DataHandler) serveOptimizedFile(c *gin.Context, filePath, requestID, stationID string) {
+	// Check if file exists
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "File not found on disk"})
+		return
+	}
+
+	// Optimize file for transfer
+	optimizedPath, stats, err := h.transferOptimizer.OptimizeFile(filePath)
+	if err != nil {
+		h.logger.Error("Failed to optimize file %s: %v", filePath, err)
+		// Fall back to serving original file
+		h.serveOriginalFile(c, filePath, requestID, stationID)
+		return
+	}
+	
+	defer func() {
+		// Cleanup optimized file if different from original
+		if err := h.transferOptimizer.CleanupOptimizedFile(optimizedPath, filePath); err != nil {
+			h.logger.Warn("Failed to cleanup optimized file: %v", err)
+		}
+	}()
+
+	// Set appropriate headers
+	filename := fmt.Sprintf("%s_%s_data", requestID, stationID)
+	if stats.CompressionUsed {
+		filename += ".gz"
+		c.Header("Content-Encoding", "gzip")
+		c.Header("X-Original-Size", fmt.Sprintf("%d", stats.OriginalSize))
+		c.Header("X-Compression-Ratio", fmt.Sprintf("%.2f", stats.CompressionStats.CompressionRatio))
+		c.Header("X-Compression-Savings", fmt.Sprintf("%.1f%%", stats.CompressionStats.SavingsPercent))
+	}
+	
+	c.Header("Content-Type", "application/octet-stream")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+	c.Header("X-Transfer-Optimized", "true")
+	c.Header("X-Transfer-Size", fmt.Sprintf("%d", stats.TransferSize))
+	
+	if stats.Checksum != "" {
+		c.Header("X-File-Checksum", stats.Checksum)
+	}
+
+	// Log transfer optimization results
+	h.logger.Info("Serving optimized file for %s_%s: compression=%v, size=%d->%d bytes (%.1f%% savings)", 
+		requestID, stationID, stats.CompressionUsed, stats.OriginalSize, stats.TransferSize, 
+		func() float64 {
+			if stats.CompressionStats != nil {
+				return stats.CompressionStats.SavingsPercent
+			}
+			return 0.0
+		}())
+
+	// Serve the optimized file
+	c.File(optimizedPath)
+}
+
+// serveOriginalFile serves the original file without optimization
+func (h *DataHandler) serveOriginalFile(c *gin.Context, filePath, requestID, stationID string) {
+	filename := fmt.Sprintf("%s_%s_data.npz", requestID, stationID)
+	c.Header("Content-Type", "application/octet-stream")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+	c.Header("X-Transfer-Optimized", "false")
+	
+	c.File(filePath)
+}
+
+// proxyOptimizedDownload proxies a download from collector with optimization
+func (h *DataHandler) proxyOptimizedDownload(c *gin.Context, downloadURL, requestID, stationID string, fileSize sql.NullInt64) {
+	// For proxy downloads, we can't easily optimize since we don't have local access
+	// This could be enhanced in the future to download, optimize, then serve
+	h.logger.Info("Proxying optimized download for %s from station %s to %s", requestID, stationID, downloadURL)
+	
+	// Create HTTP client and make request to collector
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(downloadURL)
+	if err != nil {
+		h.logger.Error("Failed to proxy download request: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Failed to download from collector"})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		h.logger.Error("Collector returned status %d for download", resp.StatusCode)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Collector download failed"})
+		return
+	}
+
+	// Set appropriate headers
+	c.Header("Content-Type", "application/octet-stream")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s_%s_data.npz\"", requestID, stationID))
+	c.Header("X-Transfer-Optimized", "proxy")
+	
+	if fileSize.Valid {
+		c.Header("Content-Length", fmt.Sprintf("%d", fileSize.Int64))
+	}
+
+	// Copy the response body directly to the client
+	c.DataFromReader(http.StatusOK, resp.ContentLength, "application/octet-stream", resp.Body, nil)
+}
+
+// GetCollectorMetrics handles GET /api/data/collector-metrics
+// Returns current collector selection metrics for monitoring
+func (h *DataHandler) GetCollectorMetrics(c *gin.Context) {
+	// Update metrics for all available collectors
+	availableStations, err := h.getAvailableStations()
+	if err != nil {
+		h.logger.Error("Failed to get available stations: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve collector information"})
+		return
+	}
+
+	h.updateCollectorMetrics(availableStations)
+
+	// Get all metrics
+	allMetrics := h.collectorSelector.GetMetrics()
+
+	// Response structure
+	response := gin.H{
+		"timestamp":         time.Now(),
+		"available_count":   len(availableStations),
+		"total_collectors":  len(allMetrics),
+		"selection_strategy": "load-balanced",
+		"collectors":        allMetrics,
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// GetTransferProgress handles GET /api/data/progress/:id
+// Returns progress information for a specific transfer
+func (h *DataHandler) GetTransferProgress(c *gin.Context) {
+	transferID := c.Param("id")
+	
+	progress, exists := h.progressTracker.GetProgress(transferID)
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Transfer not found"})
+		return
+	}
+	
+	c.JSON(http.StatusOK, progress)
+}
+
+// GetRequestProgress handles GET /api/data/request-progress/:id
+// Returns progress for all transfers associated with a request
+func (h *DataHandler) GetRequestProgress(c *gin.Context) {
+	requestID := c.Param("id")
+	
+	transfers := h.progressTracker.GetProgressByRequest(requestID)
+	
+	response := gin.H{
+		"request_id": requestID,
+		"transfers":  transfers,
+		"summary": gin.H{
+			"total_transfers": len(transfers),
+			"completed":      0,
+			"active":         0,
+			"failed":         0,
+		},
+	}
+	
+	// Calculate summary
+	for _, transfer := range transfers {
+		switch transfer.Status {
+		case "completed":
+			response["summary"].(gin.H)["completed"] = response["summary"].(gin.H)["completed"].(int) + 1
+		case "transferring", "processing":
+			response["summary"].(gin.H)["active"] = response["summary"].(gin.H)["active"].(int) + 1
+		case "failed":
+			response["summary"].(gin.H)["failed"] = response["summary"].(gin.H)["failed"].(int) + 1
+		}
+	}
+	
+	c.JSON(http.StatusOK, response)
+}
+
+// GetTransferStats handles GET /api/data/transfer-stats
+// Returns overall transfer statistics
+func (h *DataHandler) GetTransferStats(c *gin.Context) {
+	stats := h.progressTracker.GetStats()
+	
+	response := gin.H{
+		"timestamp":    time.Now(),
+		"statistics":   stats,
+		"active_transfers": h.progressTracker.GetAllProgress(),
+	}
+	
+	c.JSON(http.StatusOK, response)
+}
+
 // createDataRequest stores a new data request in the database
 func (h *DataHandler) createDataRequest(request *shared.DataRequest) error {
 	query := `
@@ -404,15 +677,15 @@ func (h *DataHandler) getDataRequestsByUser(userID string) ([]shared.DataRequest
 	return requests, nil
 }
 
-// forwardToCollectors sends the request to available collectors
+// forwardToCollectors sends the request to available collectors using advanced selection
 func (h *DataHandler) forwardToCollectors(request shared.DataRequest) error {
 	// Get available stations
-	stations, err := h.getAvailableStations()
+	availableStations, err := h.getAvailableStations()
 	if err != nil {
 		return err
 	}
 
-	if len(stations) == 0 {
+	if len(availableStations) == 0 {
 		return gin.Error{
 			Err:  nil,
 			Type: gin.ErrorTypePublic,
@@ -420,13 +693,36 @@ func (h *DataHandler) forwardToCollectors(request shared.DataRequest) error {
 		}
 	}
 
-	// Limit to maximum of 3 collectors
-	maxCollectors := 3
-	if len(stations) > maxCollectors {
-		stations = stations[:maxCollectors]
+	// Update collector metrics from database
+	h.updateCollectorMetrics(availableStations)
+
+	// Define requirements for this request
+	requirements := selection.GetDefaultRequirements()
+	// Parse request parameters to customize requirements
+	if strings.Contains(request.Parameters, "low_latency") {
+		requirements.PreferLowLatency = true
+		requirements.MaxResponseTime = 10 * time.Second
+	}
+	if strings.Contains(request.Parameters, "high_capacity") {
+		requirements.PreferHighCapacity = true
 	}
 
-	h.logger.Info("Forwarding request %s to %d collectors: %v", request.ID, len(stations), stations)
+	// Limit to maximum of 3 collectors
+	maxCollectors := 3
+	
+	// Use advanced collector selection
+	stations, err := h.collectorSelector.SelectCollectors(availableStations, requirements, maxCollectors)
+	if err != nil {
+		h.logger.Error("Advanced collector selection failed: %v, falling back to simple selection", err)
+		// Fallback to simple selection
+		stations = availableStations
+		if len(stations) > maxCollectors {
+			stations = stations[:maxCollectors]
+		}
+	}
+
+	h.logger.Info("Forwarding request %s to %d collectors (selected from %d available): %v", 
+		request.ID, len(stations), len(availableStations), stations)
 
 	// Send request to all selected collectors
 	var lastError error
@@ -492,6 +788,84 @@ func (h *DataHandler) getAvailableStations() ([]string, error) {
 	}
 
 	return stations, nil
+}
+
+// updateCollectorMetrics updates metrics for collector selection
+func (h *DataHandler) updateCollectorMetrics(stationIDs []string) {
+	for _, stationID := range stationIDs {
+		metrics := h.getCollectorMetrics(stationID)
+		if metrics != nil {
+			h.collectorSelector.UpdateMetrics(stationID, metrics)
+		}
+	}
+}
+
+// getCollectorMetrics retrieves performance metrics for a collector
+func (h *DataHandler) getCollectorMetrics(stationID string) *selection.CollectorMetrics {
+	// Query collector session and performance data
+	query := `
+		SELECT 
+			cs.station_id,
+			cs.last_heartbeat,
+			COALESCE(AVG(cr.response_time_ms), 0) as avg_response_time,
+			COALESCE(COUNT(CASE WHEN cr.status = 'ready' THEN 1 END) * 1.0 / COUNT(*), 1.0) as success_rate,
+			COUNT(CASE WHEN cr.status IN ('processing', 'assigned') THEN 1 END) as active_requests,
+			COUNT(*) as total_requests
+		FROM collector_sessions cs
+		LEFT JOIN collector_responses cr ON cs.station_id = cr.station_id 
+			AND cr.created_at > datetime('now', '-24 hours')
+		WHERE cs.station_id = ?
+		GROUP BY cs.station_id, cs.last_heartbeat
+	`
+	
+	var lastSeen time.Time
+	var responseTime, successRate float64
+	var activeRequests, totalRequests int
+	
+	err := h.db.QueryRow(query, stationID).Scan(
+		&stationID, &lastSeen, &responseTime, &successRate,
+		&activeRequests, &totalRequests,
+	)
+	
+	if err != nil {
+		h.logger.Debug("Failed to get metrics for collector %s: %v", stationID, err)
+		// Return default metrics
+		return &selection.CollectorMetrics{
+			StationID:         stationID,
+			LastSeen:         time.Now(),
+			ResponseTime:     500.0, // Default 500ms
+			SuccessRate:      0.9,   // Default 90%
+			ActiveRequests:   0,
+			TotalRequests:    0,
+			ConnectionQuality: 0.8,  // Default good quality
+			CPULoad:         0.3,   // Default moderate load
+			MemoryUsage:     0.4,   // Default moderate usage
+			DiskSpace:       0.8,   // Default 80% available
+		}
+	}
+	
+	// Calculate connection quality based on last heartbeat
+	connectionQuality := 1.0
+	timeSinceLastSeen := time.Since(lastSeen)
+	if timeSinceLastSeen > time.Minute {
+		connectionQuality = math.Max(0, 1.0-timeSinceLastSeen.Minutes()/10.0)
+	}
+	
+	return &selection.CollectorMetrics{
+		StationID:         stationID,
+		LastSeen:         lastSeen,
+		ResponseTime:     responseTime,
+		SuccessRate:      successRate,
+		ActiveRequests:   activeRequests,
+		TotalRequests:    totalRequests,
+		ConnectionQuality: connectionQuality,
+		CPULoad:         0.3, // TODO: Get from collector heartbeat
+		MemoryUsage:     0.4, // TODO: Get from collector heartbeat
+		DiskSpace:       0.8, // TODO: Get from collector heartbeat
+		GeoLocation: selection.GeoLocation{
+			Region: "default", // TODO: Configure collector regions
+		},
+	}
 }
 
 // assignStation assigns a request to a specific station

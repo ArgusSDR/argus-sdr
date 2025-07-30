@@ -97,6 +97,11 @@ func NewRouter(db *sql.DB, log *logger.Logger, cfg *config.Config) *gin.Engine {
 		data.GET("/downloads/:id", dataHandler.GetAvailableDownloads)
 		data.GET("/requests", dataHandler.ListRequests)
 		data.GET("/download/:id/:station_id", dataHandler.DownloadFile)
+		data.GET("/download-optimized/:id/:station_id", dataHandler.DownloadFileOptimized)
+		data.GET("/collector-metrics", dataHandler.GetCollectorMetrics)
+		data.GET("/progress/:id", dataHandler.GetTransferProgress)
+		data.GET("/request-progress/:id", dataHandler.GetRequestProgress) 
+		data.GET("/transfer-stats", dataHandler.GetTransferStats)
 
 		// Legacy Type 2 routes
 		data.GET("/spectrum", middleware.RequireClientType(2), type2Handler.GetSpectrum)

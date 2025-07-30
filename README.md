@@ -15,8 +15,12 @@ A comprehensive Software Defined Radio (SDR) system with three operational modes
 
 ### Advanced Features
 - **ICE Direct Transfers**: WebRTC-based peer-to-peer file transfers
-- **Load Balancing**: Automatic collector selection and failover
+- **File Compression & Optimization**: Automatic compression with intelligent benefit analysis
+- **Advanced Collector Selection**: Multiple algorithms (load-balanced, performance-based, geographic)
+- **Load Balancing**: Automatic collector selection and failover with performance metrics
+- **Progress Tracking**: Real-time transfer progress with ETA and rate calculations
 - **Health Monitoring**: Real-time connection status and heartbeat monitoring
+- **Transfer Verification**: MD5 checksums and integrity validation
 - **Graceful Shutdown**: Proper cleanup and connection management
 - **Configuration Management**: Environment-based configuration with validation
 
@@ -118,7 +122,12 @@ RECEIVER_ID=receiver-001 API_SERVER_URL=http://localhost:8080 ./argus-sdr receiv
 - `GET /api/data/status/:id` - Check request status
 - `GET /api/data/requests` - List user requests
 - `GET /api/data/downloads/:id` - Get available downloads
-- `GET /api/data/download/:id/:station_id` - Download file
+- `GET /api/data/download/:id/:station_id` - Download file (standard)
+- `GET /api/data/download-optimized/:id/:station_id` - Download file (compressed & optimized)
+- `GET /api/data/collector-metrics` - Get collector performance metrics and selection info
+- `GET /api/data/progress/:id` - Get transfer progress for specific transfer
+- `GET /api/data/request-progress/:id` - Get progress for all transfers in a request
+- `GET /api/data/transfer-stats` - Get overall transfer statistics and metrics
 
 ### ICE/WebRTC Direct Transfers
 - `POST /api/ice/request` - Initiate ICE session
